@@ -16,8 +16,10 @@ from pathlib import Path
 
 try:  # only needed when a Postgres URL is configured
     import psycopg
-except ImportError:  # SQLite-only installs (your PC, Docker) don't have it
+    psycopg_import_error = None
+except ImportError as _error:  # SQLite-only installs (your PC, Docker) don't have it
     psycopg = None
+    psycopg_import_error = str(_error)  # kept so the log can say why (e.g. a missing libpq)
 
 # Hosting platforms name the variable differently; the first one holding a postgres:// URL wins.
 POSTGRES_ENV_NAMES = ("RUBRUB_DATABASE_URL", "DATABASE_URL", "POSTGRES_URL", "POSTGRES_PRISMA_URL")
@@ -29,7 +31,22 @@ integrity_errors: tuple = (sqlite3.IntegrityError,) + ((psycopg.IntegrityError,)
 
 
 class DatabaseNotConfigured(RuntimeError):
-    """Raised when there is nothing to connect to, e.g. a Vercel project without a Postgres database."""
+    """Nothing to connect to, e.g. a Vercel project without a Postgres address. `code` is what the
+    API answers (503), so the owner can tell the cases apart without reading logs."""
+
+    code = "database_not_configured"
+
+
+class DriverMissing(DatabaseNotConfigured):
+    """There is an address, but the psycopg package could not be imported."""
+
+    code = "database_driver_missing"
+
+
+class DatabaseUnavailable(RuntimeError):
+    """The address is set and the driver is there, but the database refused or did not answer."""
+
+    code = "database_unreachable"
 
 
 def _is_postgres_url(value) -> bool:
@@ -152,9 +169,14 @@ class Connection:
 def connect() -> Connection:
     if _postgres_url:
         if psycopg is None:
-            raise DatabaseNotConfigured("DATABASE_URL is set but the 'psycopg' package is not installed")
-        # prepare_threshold=None: poolers such as Neon's PgBouncer don't support prepared statements
-        raw = psycopg.connect(_postgres_url, row_factory=_row_factory, prepare_threshold=None, connect_timeout=10)
+            raise DriverMissing(
+                "A Postgres address is set but the psycopg package could not be imported "
+                f"({psycopg_import_error or 'not installed'}). Check that requirements.txt was installed in the build.")
+        try:
+            # prepare_threshold=None: poolers such as Neon's PgBouncer don't support prepared statements
+            raw = psycopg.connect(_postgres_url, row_factory=_row_factory, prepare_threshold=None, connect_timeout=10)
+        except psycopg.Error as e:
+            raise DatabaseUnavailable(f"Could not connect to Postgres: {e}") from e
         return Connection(raw, "postgres")
     if _sqlite_path is None:
         raise DatabaseNotConfigured("no database is configured")

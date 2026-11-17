@@ -586,6 +586,34 @@ class WsgiAppTest(AppTest):
         finally:
             db.configure(*saved)  # exactly what was there before (SQLite or Postgres)
 
+    def test_each_database_problem_has_its_own_code(self):
+        """An owner who only sees the site (not the logs) can still tell the causes apart."""
+        saved, real_driver = db.settings(), db.psycopg
+        try:
+            db.configure(sqlite_path=None, postgres_url="postgres://user:secret@db.example/app")
+            db.psycopg = None  # the driver could not be imported
+            status, body, _ = self.client().request("GET", "/healthz")
+            self.assertEqual((status, body["error"]), (503, "database_driver_missing"))
+            db.psycopg = FakePsycopg  # driver present, database refuses
+            status, body, _ = self.client().request("GET", "/api/me")
+            self.assertEqual((status, body["error"]), (503, "database_unreachable"))
+            self.assertNotIn("secret", json.dumps(body))  # the reason goes to the log, never to the visitor
+            self.assertNotIn("db.example", json.dumps(body))
+        finally:
+            db.psycopg = real_driver
+            db.configure(*saved)
+
+
+class FakePsycopg:
+    """Stands in for psycopg when a test needs the database to refuse a connection."""
+
+    class Error(Exception):
+        pass
+
+    @staticmethod
+    def connect(*args, **kwargs):
+        raise FakePsycopg.Error("connection to server at db.example failed: Connection refused")
+
 
 @unittest.skipUnless(os.environ.get("RUBRUB_TEST_DATABASE_URL") and db.psycopg,
                      "set RUBRUB_TEST_DATABASE_URL (a DISPOSABLE postgres:// database) and install psycopg to run")
@@ -728,6 +756,26 @@ class DatabaseLayerTest(unittest.TestCase):
                     con.close()
             finally:
                 server.configure(old)
+
+    def test_connect_errors_carry_codes_and_explain_themselves_in_the_log(self):
+        saved, real_driver, real_error = db.settings(), db.psycopg, db.psycopg_import_error
+        try:
+            db.configure(sqlite_path=None, postgres_url="postgres://u:p@h/d")
+            db.psycopg, db.psycopg_import_error = None, "no pq wrapper available"
+            with self.assertRaises(db.DriverMissing) as ctx:
+                db.connect()
+            self.assertEqual(ctx.exception.code, "database_driver_missing")
+            self.assertIn("no pq wrapper available", str(ctx.exception))  # why the import failed
+            self.assertIsInstance(ctx.exception, db.DatabaseNotConfigured)  # old handlers still catch it
+            db.psycopg = FakePsycopg
+            with self.assertRaises(db.DatabaseUnavailable) as ctx:
+                db.connect()
+            self.assertEqual(ctx.exception.code, "database_unreachable")
+            self.assertIn("Connection refused", str(ctx.exception))
+            self.assertEqual(db.DatabaseNotConfigured.code, "database_not_configured")
+        finally:
+            db.psycopg, db.psycopg_import_error = real_driver, real_error
+            db.configure(*saved)
 
     def test_unconfigured_database_raises_a_clear_error(self):
         old = server.DATA_DIR
@@ -916,6 +964,21 @@ class DeployFilesTest(unittest.TestCase):
         for needed in ("rubrub.py", "db.py", "api/"):
             self.assertNotIn(needed, exclude)  # never leave out what the function imports
         self.assertIn("psycopg", self.read("requirements.txt"))
+
+    def test_every_english_text_has_a_thai_twin_and_every_error_code_a_message(self):
+        source = self.read("public/js/i18n.js")
+        english, thai = source.split("\n  th: {")
+        keys = lambda text: re.findall(r'(?:^[ \t]*|,[ \t]*)"?([A-Za-z][\w.]*)"?[ \t]*:[ \t]*"', text, re.M)
+        en_keys, th_keys = keys(english), keys(thai)
+        self.assertGreater(len(en_keys), 200)  # the pattern really found the strings
+        self.assertEqual(sorted(set(en_keys) - set(th_keys)), [], "missing in Thai")
+        self.assertEqual(sorted(set(th_keys) - set(en_keys)), [], "only in Thai")
+        self.assertEqual(len(en_keys), len(set(en_keys)))  # no duplicated key hiding another
+        # every error code the server can answer with has a message the page can show
+        codes = set(re.findall(r'ApiError\(\d+, "(\w+)"', self.read("rubrub.py")))
+        codes |= {db.DatabaseNotConfigured.code, db.DriverMissing.code, db.DatabaseUnavailable.code, "server_error"}
+        for code in codes - {"validation"}:
+            self.assertIn(f"err.{code}", en_keys, f"no message for error code {code}")
 
     def test_dockerfile_copies_the_files_the_app_needs(self):
         dockerfile, ignore = self.read("Dockerfile"), self.read(".dockerignore").split()

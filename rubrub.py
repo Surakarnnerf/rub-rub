@@ -840,9 +840,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.serve_static(path)
         except ApiError as e:
             self.send_json({"error": e.code, "fields": e.fields}, e.status)
-        except db.DatabaseNotConfigured as e:
-            print(f"ERROR: {e}", flush=True)
-            self.send_json({"error": "database_not_configured"}, 503)
+        except (db.DatabaseNotConfigured, db.DatabaseUnavailable) as e:
+            print(f"ERROR: {e}", flush=True)  # the full reason goes to the log, only a code goes to the visitor
+            self.send_json({"error": e.code}, 503)
         except Exception:
             traceback.print_exc()
             self.send_json({"error": "server_error"}, 500)
@@ -1135,9 +1135,9 @@ def wsgi_app(environ, start_response):
     if req.path.startswith(API_PREFIXES):
         try:
             ensure_ready()
-        except db.DatabaseNotConfigured as e:
+        except (db.DatabaseNotConfigured, db.DatabaseUnavailable) as e:
             print(f"ERROR: {e}", flush=True)
-            req.send_json({"error": "database_not_configured"}, 503)
+            req.send_json({"error": e.code}, 503)
         except Exception:
             traceback.print_exc()
             req.send_json({"error": "server_error"}, 503)
