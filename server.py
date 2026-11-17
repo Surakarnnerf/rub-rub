@@ -72,14 +72,18 @@ def drop_privileges(uid: int) -> None:
     ownership of the data folder, then carry on as an unprivileged user. No-op unless root."""
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         return
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if DATA_DIR.stat().st_uid != uid:
-        os.chown(DATA_DIR, uid, uid)
-        for p in DATA_DIR.rglob("*"):
-            os.chown(p, uid, uid, follow_symlinks=False)
-    os.setgroups([])
-    os.setgid(uid)
-    os.setuid(uid)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if DATA_DIR.stat().st_uid != uid:
+            os.chown(DATA_DIR, uid, uid)
+            for p in DATA_DIR.rglob("*"):
+                os.chown(p, uid, uid, follow_symlinks=False)
+        os.setgroups([])
+        os.setgid(uid)
+        os.setuid(uid)
+    except OSError as e:
+        # Some hosts restrict what a container may do. Keeping the site up matters more than the extra layer.
+        print(f"WARNING: could not switch to user {uid} ({e}); continuing as the current user.", flush=True)
 
 
 # --------------------------------------------------------------------------
@@ -123,6 +127,7 @@ CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
     ".svg": "image/svg+xml",
     ".png": "image/png",
     ".jpg": "image/jpeg",

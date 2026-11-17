@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -352,6 +353,49 @@ class AppTest(unittest.TestCase):
             self.assertEqual(s, 404, evil)
         self.assertEqual(c.request("GET", "/api/nope")[0], 404)
 
+    # ---- installable app (PWA) ---------------------------------------------
+    def test_app_manifest_is_installable(self):
+        c = self.client()
+        status, manifest, headers = c.request("GET", "/manifest.webmanifest")
+        self.assertEqual(status, 200)
+        self.assertTrue(headers["Content-Type"].startswith("application/manifest+json"))
+        self.assertIsInstance(manifest, dict)  # the test client parses any "...+json" body for us
+        self.assertEqual(manifest["display"], "standalone")
+        self.assertEqual(manifest["start_url"].split("?")[0], "/")
+        self.assertTrue(manifest["name"] and manifest["short_name"])
+        self.assertRegex(manifest["theme_color"], r"^#[0-9A-Fa-f]{6}$")
+        sizes = {(i["sizes"], i.get("purpose", "any")) for i in manifest["icons"]}
+        self.assertTrue({("192x192", "any"), ("512x512", "any"), ("512x512", "maskable")} <= sizes)
+        for icon in manifest["icons"]:  # every icon must be a real PNG of the size it claims
+            status, data, h = c.request("GET", icon["src"])
+            self.assertEqual((status, h["Content-Type"]), (200, "image/png"), icon["src"])
+            self.assertEqual(data[:8], PNG[:8], icon["src"])
+            w, h_ = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+            self.assertEqual(f"{w}x{h_}", icon["sizes"], icon["src"])
+
+    def test_page_links_the_app_files(self):
+        c = self.client()
+        html = c.request("GET", "/")[1].decode()
+        for needle in ('rel="manifest" href="/manifest.webmanifest"', 'rel="apple-touch-icon" href="/icons/apple-touch-icon.png"',
+                       "viewport-fit=cover", 'name="apple-mobile-web-app-capable"', 'src="/js/pwa.js"'):
+            self.assertIn(needle, html)
+        status, data, h = c.request("GET", "/icons/apple-touch-icon.png")
+        self.assertEqual((status, data[:8]), (200, PNG[:8]))
+        self.assertEqual((int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")), (180, 180))
+
+    def test_service_worker_precaches_only_files_that_exist(self):
+        c = self.client()
+        status, sw, h = c.request("GET", "/sw.js")
+        self.assertEqual(status, 200)
+        self.assertTrue(h["Content-Type"].startswith("text/javascript"))
+        self.assertEqual(h["Cache-Control"], "no-cache")  # browsers must always re-check the worker itself
+        shell = re.search(r"const SHELL = \[(.*?)\];", sw.decode(), re.S).group(1)
+        urls = re.findall(r"'(/[^']*)'", shell)
+        self.assertGreaterEqual(len(urls), 8)
+        for url in urls:
+            self.assertEqual(c.request("GET", url)[0], 200, f"{url} is pre-cached by the service worker but missing")
+        self.assertIn("/api/", sw.decode())  # and it must leave live data alone
+
 
 class HostingTest(unittest.TestCase):
     """Behaviour that matters once the app sits behind a hosting platform's proxy."""
@@ -481,6 +525,59 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(server.env_flag("X", False, {"X": raw}), want, raw)
         self.assertTrue(server.env_flag("X", True, {}))  # unset or blank falls back to the default
         self.assertTrue(server.env_flag("X", True, {"X": " "}))
+
+    def test_drop_privileges_switches_user_after_fixing_the_data_folder(self):
+        from unittest import mock
+
+        old = server.DATA_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                server.configure(tmp)
+                calls = []
+                fake = lambda name: mock.Mock(side_effect=lambda *a, **k: calls.append((name, a)))
+                with mock.patch.object(os, "geteuid", create=True, return_value=0), \
+                        mock.patch.object(os, "chown", fake("chown"), create=True), \
+                        mock.patch.object(os, "setgroups", fake("setgroups"), create=True), \
+                        mock.patch.object(os, "setgid", fake("setgid"), create=True), \
+                        mock.patch.object(os, "setuid", fake("setuid"), create=True):
+                    server.drop_privileges(10001)
+                names = [c[0] for c in calls]
+                self.assertEqual(calls[0], ("chown", (server.DATA_DIR, 10001, 10001)))  # data folder first...
+                self.assertEqual(names[-3:], ["setgroups", "setgid", "setuid"])  # ...then give up root, user last
+            finally:
+                server.configure(old)
+
+    def test_drop_privileges_keeps_the_site_up_in_a_restricted_container(self):
+        from unittest import mock
+
+        old = server.DATA_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                server.configure(tmp)
+                refuse = mock.Mock(side_effect=PermissionError("operation not permitted"))
+                out = io.StringIO()
+                with mock.patch.object(os, "geteuid", create=True, return_value=0), \
+                        mock.patch.object(os, "chown", refuse, create=True), \
+                        mock.patch.object(os, "setgroups", refuse, create=True), \
+                        mock.patch.object(os, "setgid", refuse, create=True), \
+                        mock.patch.object(os, "setuid", refuse, create=True), \
+                        contextlib.redirect_stdout(out):
+                    server.drop_privileges(10001)  # must warn, not crash on start-up
+                self.assertIn("WARNING", out.getvalue())
+            finally:
+                server.configure(old)
+
+    def test_render_blueprint_matches_the_dockerfile_and_server(self):
+        root = Path(__file__).resolve().parent.parent
+        blueprint = (root / "render.yaml").read_text(encoding="utf-8")
+        dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("runtime: docker", blueprint)
+        self.assertIn("healthCheckPath: /healthz", blueprint)  # the route the server really has
+        self.assertRegex(blueprint, r"key: RUBRUB_TRUST_PROXY[^\n]*\n\s+value: \"1\"")
+        mount = re.search(r"mountPath: (\S+)", blueprint).group(1)
+        self.assertEqual(f"RUBRUB_DATA_DIR={mount}", re.search(r"RUBRUB_DATA_DIR=\S+", dockerfile).group(0))  # disk == data folder
+        self.assertRegex(blueprint, r"(?m)^\s+sizeGB: \d+")
+        self.assertIsNone(re.search(r"(?m)^\s+plan: free", blueprint))  # the shipped default is the one that keeps data
 
     def test_drop_privileges_does_nothing_without_root(self):
         if hasattr(os, "geteuid") and os.geteuid() == 0:

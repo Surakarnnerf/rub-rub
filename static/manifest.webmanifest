@@ -1,0 +1,26 @@
+{
+  "id": "/",
+  "name": "Rub rub – Thai street food reviews",
+  "short_name": "Rub rub",
+  "description": "Honest Thai street food reviews: what to order, what it costs, how to pay and when the cart is open.",
+  "start_url": "/?source=app",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#FFF4E0",
+  "theme_color": "#B02A13",
+  "lang": "en",
+  "categories": ["food", "lifestyle"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "Write a review",
+      "short_name": "Write",
+      "url": "/#/new",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ]
+}

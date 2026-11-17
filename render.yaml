@@ -1,0 +1,21 @@
+# One-click deploy to Render (https://render.com): see "Deploy" in README.md.
+# Render builds the Dockerfile, gives the site an https:// address and keeps /data on a persistent disk.
+#
+# A persistent disk needs a PAID instance. To try the site for free instead, set `plan: free` and delete
+# the `disk:` block: it then works, but all accounts and reviews are lost whenever Render restarts or
+# puts the idle service to sleep.
+services:
+  - type: web
+    name: rub-rub
+    runtime: docker
+    plan: 0.5c-512mb        # smallest paid instance (older name: starter)
+    region: singapore       # closest Render region to Thailand
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit   # redeploy whenever you push to GitHub
+    envVars:
+      - key: RUBRUB_TRUST_PROXY   # Render sits in front of the app: read the real visitor IP and HTTPS
+        value: "1"
+    disk:
+      name: rubrub-data
+      mountPath: /data        # the Docker image keeps the database and photos here
+      sizeGB: 1

@@ -8,6 +8,8 @@
   /* i18n                                                                */
   /* ------------------------------------------------------------------ */
   const I18N = window.I18N;
+  // pwa.js (service worker + install prompt) is optional: the site works without it
+  const PWA = window.RubPWA || { standalone: () => false, ios: () => false, canPrompt: () => false, onChange() {}, install: async () => 'unavailable' };
   const LANGS = ['en', 'th'];
   let lang = '';
   try { lang = localStorage.getItem('rr_lang') || ''; } catch (e) { /* storage blocked */ }
@@ -57,6 +59,8 @@
     plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
     link: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.700 0l3-3a4 4 0 0 0-5.700-5.700l-1 1M14 10a4 4 0 0 0-5.700 0l-3 3a4 4 0 0 0 5.700 5.700l1-1"/></svg>',
     badge: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.500l2.600 2 3.200-.3 1.100 3 2.800 1.700-.9 3.100.9 3.100-2.800 1.700-1.100 3-3.200-.3-2.600 2-2.600-2-3.200.3-1.100-3L2.300 14.700l.9-3.100-.9-3.100L5.100 6.800l1.100-3 3.200.3z"/><path d="M8 12.200l2.800 2.800L16.200 9.500" fill="none" stroke="#fff" stroke-width="2.200" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 11.500L12 4l8 7.500V20a1 1 0 0 1-1 1h-4.500v-6h-5v6H5a1 1 0 0 1-1-1z"/></svg>',
+    user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.400 3.600-7 8-7s8 2.600 8 7"/></svg>',
   };
   const icon = (name, cls) => el('span', { class: 'ic' + (cls ? ' ' + cls : ''), html: ICON[name] });
 
@@ -363,8 +367,79 @@
         el('span', { class: 'brand-mark', html: ICON.flame }), el('span', { class: 'brand-name' }, 'Rub rub')),
       el('div', { class: 'topbar-actions' }, langToggle(), accountArea())));
     $('#footer').replaceChildren(el('div', { class: 'wrap footer-in' },
-      el('strong', null, 'Rub rub'), el('span', null, t('footer'))));
+      el('strong', null, 'Rub rub'), el('span', null, t('footer')),
+      !PWA.standalone() && el('button', { class: 'link-btn footer-link', type: 'button', onClick: installApp }, t('install.footer'))));
     $('#fab-slot').replaceChildren(el('a', { class: 'fab', href: '#/new', 'aria-label': t('nav.write') }, icon('plus'), el('span', { class: 'fab-text' }, t('nav.write'))));
+    renderTabbar();
+    renderInstall();
+    renderNet();
+  }
+
+  /** App-style bottom bar (phones): Home, Write, and Me / Log in. */
+  function renderTabbar() {
+    const path = (location.hash.replace(/^#/, '') || '/').split('?')[0];
+    const me = state.user;
+    const meActive = me ? path.toLowerCase() === '/user/' + me.username.toLowerCase() : /^\/(login|signup)$/.test(path);
+    const tab = (href, ic, label, active, cls) => el('a', {
+      class: 'tab' + (cls ? ' ' + cls : '') + (active ? ' on' : ''), href, 'aria-current': active ? 'page' : null,
+    }, icon(ic), el('span', null, label));
+    $('#tabbar').replaceChildren(
+      tab('#/', 'home', t('nav.home'), path === '/'),
+      tab('#/new', 'plus', t('tab.write'), /^\/(new|edit)/.test(path), 'tab-write'),
+      tab(me ? '#/user/' + encodeURIComponent(me.username) : '#/login', 'user', me ? t('tab.me') : t('tab.signin'), meActive));
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Install as an app + offline notice                                  */
+  /* ------------------------------------------------------------------ */
+  const INSTALL_KEY = 'rr_install_dismissed';
+  function installDismissed() {
+    try { return Date.now() - Number(localStorage.getItem(INSTALL_KEY) || 0) < 14 * 86400000; } catch (e) { return false; }
+  }
+  function dismissInstall() {
+    try { localStorage.setItem(INSTALL_KEY, String(Date.now())); } catch (e) { /* ignore */ }
+    renderInstall();
+  }
+
+  function showInstallHelp() {
+    const dlg = el('dialog', { class: 'sheet', 'aria-labelledby': 'sheet-title' },
+      el('h2', { id: 'sheet-title' }, t('install.title')),
+      el('p', null, PWA.ios() ? t('install.ios') : t('install.other')),
+      el('button', { class: 'btn btn-primary btn-block', type: 'button', onClick: () => dlg.close() }, t('install.gotIt')));
+    dlg.addEventListener('close', () => dlg.remove());
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
+    document.body.append(dlg);
+    if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '');
+  }
+
+  async function installApp() {
+    if (PWA.canPrompt()) {
+      if ((await PWA.install()) === 'accepted') toast(t('install.done'));
+    } else {
+      showInstallHelp(); // iPhone/iPad and browsers without an install prompt
+    }
+  }
+
+  /** "Add to home screen" card on the home page of phones. */
+  function renderInstall() {
+    const slot = $('#install-slot');
+    const path = (location.hash.replace(/^#/, '') || '/').split('?')[0];
+    const canShow = path === '/' && !PWA.standalone() && !installDismissed() && (PWA.canPrompt() || PWA.ios());
+    if (!canShow) { slot.replaceChildren(); return; }
+    slot.replaceChildren(el('aside', { class: 'install-banner', 'aria-label': t('install.title') },
+      el('span', { class: 'brand-mark', html: ICON.flame }),
+      el('div', { class: 'install-text' }, el('strong', null, t('install.title')),
+        el('span', null, PWA.canPrompt() ? t('install.sub') : t('install.ios'))),
+      el('div', { class: 'install-actions' },
+        PWA.canPrompt() && el('button', { class: 'btn btn-primary btn-sm', type: 'button', onClick: installApp }, t('install.btn')),
+        el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: dismissInstall }, PWA.canPrompt() ? t('install.later') : t('install.gotIt')))));
+  }
+
+  function renderNet() {
+    const bar = $('#netbar');
+    const off = navigator.onLine === false;
+    bar.hidden = !off;
+    bar.textContent = off ? t('offline') : '';
   }
 
   function setLang(l) {
@@ -622,7 +697,8 @@
             stat(user.review_count, t('stat.reviewsLabel')),
             stat(user.avg_rating != null ? user.avg_rating : '–', t('stat.avgLabel')),
             stat(user.likes_received, t('stat.likesLabel'))),
-          mine && !user.is_featured && !user.is_famous && el('p', { class: 'hint' }, t('famous.hint', { n: user.famous_at })))),
+          mine && !user.is_featured && !user.is_famous && el('p', { class: 'hint' }, t('famous.hint', { n: user.famous_at })),
+          mine && el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: logout }, t('nav.logout')))),
       el('h2', { class: 'profile-h2' }, t('profile.reviewsBy', { name: user.display_name })),
       reviews.length
         ? el('div', { class: 'grid' }, reviews.map(reviewCard))
@@ -1048,6 +1124,8 @@
     const main = $('#main');
     const path = (location.hash.replace(/^#/, '') || '/').split('?')[0];
     document.body.dataset.route = /^\/(new|edit)/.test(path) ? 'form' : /^\/(login|signup)$/.test(path) ? 'auth' : 'page';
+    renderTabbar();
+    renderInstall();
     main.replaceChildren(loadingNode());
     let node;
     const hit = routes.find(([rx]) => rx.test(path));
@@ -1067,6 +1145,14 @@
     try { state.user = (await api('GET', '/api/me')).user; } catch (e) { /* offline: stay logged out */ }
     renderChrome();
     window.addEventListener('hashchange', render);
+    PWA.onChange(renderChrome);
+    window.addEventListener('offline', renderNet);
+    window.addEventListener('online', () => {
+      renderNet();
+      toast(t('backOnline'));
+      // refresh the page we are on, but never wipe a half-written review or login form
+      if (!['form', 'auth'].includes(document.body.dataset.route)) render();
+    });
     render();
   }
 

@@ -54,6 +54,29 @@ Every review has a category: **ข้าวมันไก่ (Khao Man Gai) · 
 menu name (English or Thai) and can be changed. Reviews written before categories existed
 are upgraded automatically the next time the server starts.
 
+## Use it as a phone app
+
+Rub rub is an installable web app (a PWA): same website, but with its own home-screen icon,
+full-screen window without the browser bar, an app-style bottom tab bar (Home · Write · Me)
+and an app shell that still opens when the phone has no signal (reviews themselves need a
+connection).
+
+| Phone | How to install |
+| --- | --- |
+| **Android** (Chrome, Edge, Samsung Internet) | tap **Install** on the "Get the Rub rub app" card on the home page, or the browser menu → **Install app** / **Add to Home screen** |
+| **iPhone / iPad** (Safari) | **Share** button → **Add to Home Screen** (iOS has no install button for websites; the card on the home page and the "Install the app" footer link explain this) |
+
+**It must be opened over HTTPS** (any hosted site, see [Deploy](#deploy-to-a-real-host)) or on
+`localhost`. On a plain `http://192.168…` address phones only allow a simple shortcut, with no
+offline support.
+
+Not included: a listing in Google Play or the App Store. That needs a native wrapper
+(Capacitor, or a Trusted Web Activity on Android) and paid developer accounts.
+
+The app files are `static/manifest.webmanifest` (name, colours, icons), `static/sw.js`
+(offline cache; it never caches `/api/`, bump `VERSION` there if you change its rules),
+`static/js/pwa.js` (install prompt) and `static/icons/`.
+
 ## How it works
 
 ```
@@ -61,6 +84,9 @@ server.py            API + static file server + SQLite (stdlib only)
 static/              single-page front end (HTML, CSS, vanilla JS)
   js/app.js          router, pages, review form
   js/i18n.js         English / Thai text
+  js/pwa.js          "install as an app" helpers, registers the service worker
+  sw.js              service worker (offline app shell)
+  manifest.webmanifest, icons/   home-screen name, colours and icons
   css/style.css      the warm, spicy theme
 data/rubrub.db       users, sessions, reviews, likes (created on first run)
 data/uploads/        review photos (resized in the browser before upload)
@@ -89,7 +115,26 @@ Those run static files and short-lived serverless functions. Rub rub is a long-r
 that keeps its accounts, reviews and photos in a SQLite file and an uploads folder, so it needs
 a host that **runs a process and keeps a disk**: Render, Railway, Fly.io, a VPS, or your own PC.
 
-### Steps (any host that can build a Dockerfile)
+### Easiest: Render, in one click
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Surakarnnerf/rub-rub)
+
+`render.yaml` already describes everything: the Docker build, the Singapore region (closest to
+Thailand), the `/healthz` health check, `RUBRUB_TRUST_PROXY=1` and a 1 GB persistent disk at `/data`.
+
+1. Click the button, sign in to Render with GitHub and confirm. Render shows the monthly cost
+   before you accept: a persistent disk needs a **paid** instance (at the time of writing about
+   $7 a month for the smallest one, plus $0.25 per GB of disk; check
+   [render.com/pricing](https://render.com/pricing)).
+2. Wait for the first build (a few minutes). Render then shows your link, something like
+   `https://rub-rub.onrender.com`. Open it on any phone.
+3. Every `git push` to `main` redeploys the site automatically.
+
+**Just trying it out?** In `render.yaml` set `plan: free` and delete the `disk:` block. The site
+works, but a free service sleeps after 15 idle minutes and **loses all accounts and reviews
+whenever it restarts**.
+
+### Steps for any other host that can build a Dockerfile
 1. Create a **web service from this GitHub repo**; the `Dockerfile` does the build (there is
    nothing to install).
 2. Attach a **persistent disk / volume mounted at `/data`** (1 GB is plenty). Without it every
