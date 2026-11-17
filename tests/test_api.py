@@ -674,6 +674,22 @@ class DatabaseLayerTest(unittest.TestCase):
         self.assertEqual(pick({"DATABASE_URL": "postgresql://pooled/x", "POSTGRES_URL": "postgres://other/y"}), "postgresql://pooled/x")
         self.assertEqual(pick({"RUBRUB_DATABASE_URL": "postgres://mine/z", "DATABASE_URL": "postgres://o/p"}), "postgres://mine/z")
 
+    def test_postgres_url_under_a_custom_prefix_is_found_on_vercel(self):
+        env = {"STORAGE_URL_NON_POOLING": "postgres://direct/db", "STORAGE_URL": "postgres://pooled/db",
+               "NEXT_PUBLIC_SITE_URL": "https://example.com", "STORAGE_PRISMA_URL": "postgres://prisma/db"}
+        self.assertIsNone(db.postgres_url_from_env(env))  # on a PC only the well-known names count
+        self.assertEqual(db.postgres_url_from_env(env, any_name=True), "postgres://pooled/db")  # pooled beats direct
+        self.assertEqual(db.postgres_url_from_env({"A_URL_UNPOOLED": "postgresql://u", "B": "postgres://prisma"}, any_name=True),
+                         "postgres://prisma")
+        self.assertIsNone(db.postgres_url_from_env({"SOME_URL": "https://x", "N": "123"}, any_name=True))
+        # a well-known name always wins over a scan
+        self.assertEqual(db.postgres_url_from_env({"DATABASE_URL": "postgres://known/db", "AAA_URL": "postgres://other/db"}, any_name=True),
+                         "postgres://known/db")
+
+    def test_related_variable_names_never_include_values(self):
+        names = db.related_variable_names({"STORAGE_URL": "postgres://user:secret@h/db", "PATH": "x", "NEON_PROJECT_ID": "p"})
+        self.assertEqual(names, ["NEON_PROJECT_ID", "STORAGE_URL"])
+
     def test_placeholders_become_psycopg_style(self):
         self.assertEqual(db._pg_sql("SELECT 1 WHERE a = ? AND b LIKE '%x' AND c = ?"),
                          "SELECT 1 WHERE a = %s AND b LIKE '%%x' AND c = %s")
@@ -734,6 +750,18 @@ class VercelEnvironmentTest(unittest.TestCase):
         with self.assertRaises(db.DatabaseNotConfigured) as ctx:
             server.apply_environment({"VERCEL": "1"})
         self.assertIn("Postgres", str(ctx.exception))
+
+    def test_vercel_finds_a_database_whatever_prefix_the_integration_used(self):
+        server.apply_environment({"VERCEL": "1", "STORAGE_URL": "postgres://u:p@host/db?sslmode=require"})
+        self.assertEqual(db.engine(), "postgres")
+
+    def test_the_error_names_nearby_variables_but_never_leaks_values(self):
+        with self.assertRaises(db.DatabaseNotConfigured) as ctx:
+            server.apply_environment({"VERCEL": "1", "SOME_API_URL": "https://secret.example/token123"})
+        message = str(ctx.exception)
+        self.assertIn("SOME_API_URL", message)
+        self.assertIn("REDEPLOY", message)
+        self.assertNotIn("token123", message)
 
     def test_vercel_with_a_database_trusts_the_proxy_and_uses_postgres(self):
         server.apply_environment({"VERCEL": "1", "POSTGRES_URL": "postgres://u:p@host/db?sslmode=require"})

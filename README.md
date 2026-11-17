@@ -138,6 +138,12 @@ function (`api/index.py`). It has no disk, so the accounts, reviews and photos l
    it to the project for all environments. Vercel adds `DATABASE_URL` and friends by itself.
 3. **Redeploy** (Deployments → the latest one → ⋯ → Redeploy), because environment variables
    only reach new deployments.
+
+   **Still "database isn't connected yet"?** Open `https://YOUR-SITE.vercel.app/healthz`. If it
+   says `database_not_configured`, the app found no Postgres address: check Settings →
+   Environment Variables for a variable whose value starts with `postgres://` (any name works,
+   including a prefixed one such as `STORAGE_URL`), and redeploy after adding it. The function
+   log (Deployments → the deployment → Logs) lists the names of related variables it did see.
 4. Open your link on a phone. The first request creates the tables and the sample profiles
    (a few seconds), after that it is fast. Every `git push` to `main` redeploys.
 
@@ -200,7 +206,7 @@ docker run --rm -p 8000:8000 -v rubrub-data:/data rub-rub
 ## Environment variables
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DATABASE_URL` (also `POSTGRES_URL`, `RUBRUB_DATABASE_URL`) | unset | a `postgres://` URL switches the app from the SQLite file to Postgres. Vercel's Neon integration sets it for you |
+| `DATABASE_URL` (also `POSTGRES_URL`, `RUBRUB_DATABASE_URL`) | unset | a `postgres://` URL switches the app from the SQLite file to Postgres. Vercel's Neon integration sets it for you; **on Vercel any variable holding a `postgres://` URL is found**, whatever prefix the integration used (pooled connections are preferred) |
 | `PORT` | `8000` | port to listen on; when set, the app binds `0.0.0.0` |
 | `RUBRUB_DATA_DIR` | `./data` (`/data` in the Docker image) | where the SQLite file lives; point it at the persistent disk |
 | `RUBRUB_TRUST_PROXY` | off (on in Vercel) | **set to `1` behind a hosting proxy**; leave off when clients connect directly, because they could forge the headers |

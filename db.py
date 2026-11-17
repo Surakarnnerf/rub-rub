@@ -32,13 +32,37 @@ class DatabaseNotConfigured(RuntimeError):
     """Raised when there is nothing to connect to, e.g. a Vercel project without a Postgres database."""
 
 
-def postgres_url_from_env(environ=None) -> str | None:
+def _is_postgres_url(value) -> bool:
+    return isinstance(value, str) and value.strip().startswith(("postgres://", "postgresql://"))
+
+
+def postgres_url_from_env(environ=None, any_name: bool = False) -> str | None:
+    """The Postgres URL the hosting platform gave us.
+
+    The usual names are tried first. With any_name=True (used on Vercel) any variable holding a
+    postgres:// URL counts: Vercel lets you put a prefix in front of the names a database integration
+    creates (STORAGE_URL, MYDB_DATABASE_URL...). Pooled connections win over direct ones, because
+    serverless functions open a connection per request."""
     env = os.environ if environ is None else environ
     for name in POSTGRES_ENV_NAMES:
-        value = (env.get(name) or "").strip()
-        if value.startswith(("postgres://", "postgresql://")):
-            return value
-    return None
+        if _is_postgres_url(env.get(name)):
+            return env[name].strip()
+    if not any_name:
+        return None
+    found = []
+    for name, value in env.items():
+        if _is_postgres_url(value):
+            upper = name.upper()
+            penalty = (2 if ("UNPOOLED" in upper or "NON_POOLING" in upper) else 0) + (1 if "PRISMA" in upper else 0)
+            found.append((penalty, name, value.strip()))
+    return min(found)[2] if found else None
+
+
+def related_variable_names(environ=None) -> list:
+    """Names (never values) of variables that might hold a database address: for error messages."""
+    env = os.environ if environ is None else environ
+    hints = ("URL", "POSTGRES", "DATABASE", "STORAGE", "NEON", "PG")
+    return sorted(name for name in env if any(h in name.upper() for h in hints))
 
 
 def configure(sqlite_path=None, postgres_url: str | None = None) -> None:

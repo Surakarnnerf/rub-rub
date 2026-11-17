@@ -1095,14 +1095,15 @@ def apply_environment(environ=None) -> None:
     on_vercel = bool(env.get("VERCEL"))
     if env.get("RUBRUB_DATA_DIR"):
         configure(env["RUBRUB_DATA_DIR"])
-    url = db.postgres_url_from_env(env)
+    url = db.postgres_url_from_env(env, any_name=on_vercel)
     if url:
         use_postgres(url)
     elif on_vercel:
         # Vercel has no disk to keep a SQLite file on: without a Postgres database nothing can be saved
         raise db.DatabaseNotConfigured(
-            "No Postgres database is connected. In the Vercel dashboard open Storage, create a Neon "
-            "Postgres database, connect it to this project and redeploy.")
+            "No Postgres address found in the environment. In the Vercel dashboard open Storage, create a "
+            "Neon Postgres database, connect it to this project and REDEPLOY (variables only reach new "
+            "deployments). Variables that look related (names only): " + (", ".join(db.related_variable_names(env)) or "none"))
     if on_vercel or "RUBRUB_TRUST_PROXY" in env:  # Vercel always sits in front of the app and sets X-Forwarded-*
         configure_proxy(env_flag("RUBRUB_TRUST_PROXY", on_vercel, env), int(env.get("RUBRUB_PROXY_HOPS") or 1),
                         env_flag("RUBRUB_SECURE_COOKIES", False, env))
