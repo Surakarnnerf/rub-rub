@@ -11,8 +11,10 @@ package (see requirements.txt); SQLite needs nothing.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 try:  # only needed when a Postgres URL is configured
     import psycopg
@@ -32,9 +34,14 @@ integrity_errors: tuple = (sqlite3.IntegrityError,) + ((psycopg.IntegrityError,)
 
 class DatabaseNotConfigured(RuntimeError):
     """Nothing to connect to, e.g. a Vercel project without a Postgres address. `code` is what the
-    API answers (503), so the owner can tell the cases apart without reading logs."""
+    API answers (503), so the owner can tell the cases apart without reading logs. `details` may list
+    related variable NAMES (never values) to help the owner fix the settings."""
 
     code = "database_not_configured"
+
+    def __init__(self, message: str, details=None):
+        super().__init__(message)
+        self.details = list(details or [])
 
 
 class DriverMissing(DatabaseNotConfigured):
@@ -49,37 +56,65 @@ class DatabaseUnavailable(RuntimeError):
     code = "database_unreachable"
 
 
-def _is_postgres_url(value) -> bool:
-    return isinstance(value, str) and value.strip().startswith(("postgres://", "postgresql://"))
+_URL_IN_TEXT = re.compile(r"postgres(?:ql)?://[^\s'\"<>]+")
+
+
+def extract_postgres_url(value) -> str | None:
+    """The postgres:// address inside a variable's value. It tolerates what people end up with:
+    quotes around it, or a whole command such as  psql 'postgresql://user:pass@host/db'."""
+    match = _URL_IN_TEXT.search(value) if isinstance(value, str) else None
+    return match.group(0) if match else None
+
+
+def postgres_url_from_parts(env) -> str | None:
+    """Build the address from libpq's separate variables (PGHOST, PGUSER, PGPASSWORD, PGDATABASE),
+    which Neon's Vercel integration also sets. Passwords are percent-encoded so any character is safe."""
+    host, user, database = env.get("PGHOST"), env.get("PGUSER"), env.get("PGDATABASE")
+    if not (host and user and database):
+        return None
+    password, port = env.get("PGPASSWORD"), env.get("PGPORT")
+    auth = quote(user, safe="") + (":" + quote(password, safe="") if password else "")
+    return (f"postgresql://{auth}@{host}{':' + port if port else ''}/{quote(database, safe='')}"
+            f"?sslmode={quote(env.get('PGSSLMODE') or 'require', safe='')}")
 
 
 def postgres_url_from_env(environ=None, any_name: bool = False) -> str | None:
-    """The Postgres URL the hosting platform gave us.
+    """The Postgres address the hosting platform gave us.
 
-    The usual names are tried first. With any_name=True (used on Vercel) any variable holding a
-    postgres:// URL counts: Vercel lets you put a prefix in front of the names a database integration
-    creates (STORAGE_URL, MYDB_DATABASE_URL...). Pooled connections win over direct ones, because
-    serverless functions open a connection per request."""
+    The usual names are tried first. With any_name=True (used on Vercel) any variable that holds a
+    postgres:// address counts, because Vercel lets you put a prefix in front of the names a database
+    integration creates (STORAGE_URL, MYDB_DATABASE_URL...); as a last resort the separate PG*
+    variables are assembled. Pooled connections win over direct ones, because serverless functions
+    open a connection per request."""
     env = os.environ if environ is None else environ
     for name in POSTGRES_ENV_NAMES:
-        if _is_postgres_url(env.get(name)):
-            return env[name].strip()
+        url = extract_postgres_url(env.get(name))
+        if url:
+            return url
     if not any_name:
         return None
     found = []
     for name, value in env.items():
-        if _is_postgres_url(value):
+        url = extract_postgres_url(value)
+        if url:
             upper = name.upper()
             penalty = (2 if ("UNPOOLED" in upper or "NON_POOLING" in upper) else 0) + (1 if "PRISMA" in upper else 0)
-            found.append((penalty, name, value.strip()))
-    return min(found)[2] if found else None
+            found.append((penalty, name, url))
+    return min(found)[2] if found else postgres_url_from_parts(env)
+
+
+def describe_variables(environ=None) -> list:
+    """For the owner when nothing was found: the names of variables that might hold a database
+    address, each marked postgres-url (it holds one) or other. NEVER the values."""
+    env = os.environ if environ is None else environ
+    hints = ("URL", "POSTGRES", "DATABASE", "STORAGE", "NEON", "PG")
+    return [f"{name}={'postgres-url' if extract_postgres_url(env[name]) else 'other'}"
+            for name in sorted(env) if any(h in name.upper() for h in hints)]
 
 
 def related_variable_names(environ=None) -> list:
-    """Names (never values) of variables that might hold a database address: for error messages."""
-    env = os.environ if environ is None else environ
-    hints = ("URL", "POSTGRES", "DATABASE", "STORAGE", "NEON", "PG")
-    return sorted(name for name in env if any(h in name.upper() for h in hints))
+    """Names only (no values, no verdicts): for log messages."""
+    return [item.split("=")[0] for item in describe_variables(environ)]
 
 
 def configure(sqlite_path=None, postgres_url: str | None = None) -> None:

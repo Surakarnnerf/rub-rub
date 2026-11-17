@@ -42,10 +42,15 @@ On first run two demo profiles are created. Both are locked until you give them 
 | `claude` | the featured **Famous food blogger**, 8 reviews, "Chef's Pick" on the home page | `python rubrub.py --reset-password claude` |
 | `test_blogger` ("Test Eater") | a **Famous reviewer**: 6 reviews with 52 likes from 12 fictional "demo_…" fans | `python rubrub.py --reset-password test_blogger` |
 
+Twelve more locked `demo_…` foodies (Nok, Pim, Ton, …) like the reviews, and eight of them wrote
+one review each, so a fresh site shows **22 sample reviews** from 10 profiles, spread over every
+category and payment type.
+
 All the sample reviews are demo data: the vendors in them are **fictional** and are
 labelled "Sample" in the app. To start clean, delete the `data` folder before you launch
-for real, or run with `--no-seed` on a fresh database. Demo profiles are only added once;
-deleting a sample review never brings it back.
+for real, or run with `--no-seed` on a fresh database. Demo data is added in versions (see
+`SEED_VERSION` in `rubrub.py`): a site seeded earlier gets only what is new on its next start,
+and deleting a sample review never brings it back.
 
 ### How people become famous
 Anyone whose reviews collect **25 likes from other people** (`FAMOUS_LIKES` in `rubrub.py`)

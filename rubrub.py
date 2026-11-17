@@ -109,7 +109,7 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 PAYMENTS = ("cash_only", "qr", "card")
 CATEGORIES = ("khao_man_gai", "kra_pao", "noodles", "other")  # ข้าวมันไก่, ข้าวกระเพรา, ก๋วยเตี๋ยว, อื่นๆ
 FAMOUS_LIKES = 25  # likes received (on all their reviews) before a reviewer earns the "famous" badge
-SEED_VERSION = 2
+SEED_VERSION = 3  # 2 = Claude + Test Eater, 3 = eight more sample reviews from other sample foodies
 CATEGORY_KEYWORDS = (  # checked in order; keep in sync with guessCategory() in public/js/app.js
     ("khao_man_gai", ("khao man gai", "kao man gai", "man gai", "hainan", "ข้าวมันไก่")),
     ("kra_pao", ("kra pao", "kaprao", "krapow", "ka prao", "กะเพรา", "กระเพรา")),
@@ -842,7 +842,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": e.code, "fields": e.fields}, e.status)
         except (db.DatabaseNotConfigured, db.DatabaseUnavailable) as e:
             print(f"ERROR: {e}", flush=True)  # the full reason goes to the log, only a code goes to the visitor
-            self.send_json({"error": e.code}, 503)
+            self.send_json(database_problem(e), 503)
         except Exception:
             traceback.print_exc()
             self.send_json({"error": "server_error"}, 500)
@@ -1050,6 +1050,16 @@ def make_server(host: str, port: int) -> RubServer:
 API_PREFIXES = ("/api/", "/uploads/", "/healthz")
 
 
+def database_problem(error) -> dict:
+    """What a visitor may learn about a database problem: a code, and for a site that has no database
+    address yet the NAMES of related settings (never values), so the owner can see what is missing."""
+    body = {"error": error.code}
+    details = getattr(error, "details", None)
+    if details:
+        body["variables_seen"] = details
+    return body
+
+
 def request_target(environ) -> tuple[str, str]:
     """(path, query string) of the original request.
 
@@ -1100,10 +1110,12 @@ def apply_environment(environ=None) -> None:
         use_postgres(url)
     elif on_vercel:
         # Vercel has no disk to keep a SQLite file on: without a Postgres database nothing can be saved
+        seen = db.describe_variables(env)
         raise db.DatabaseNotConfigured(
             "No Postgres address found in the environment. In the Vercel dashboard open Storage, create a "
-            "Neon Postgres database, connect it to this project and REDEPLOY (variables only reach new "
-            "deployments). Variables that look related (names only): " + (", ".join(db.related_variable_names(env)) or "none"))
+            "Neon Postgres database, connect it to this project (tick Production) and REDEPLOY (variables only "
+            "reach new deployments). Variables that look related (names only): " + (", ".join(seen) or "none"),
+            details=seen)
     if on_vercel or "RUBRUB_TRUST_PROXY" in env:  # Vercel always sits in front of the app and sets X-Forwarded-*
         configure_proxy(env_flag("RUBRUB_TRUST_PROXY", on_vercel, env), int(env.get("RUBRUB_PROXY_HOPS") or 1),
                         env_flag("RUBRUB_SECURE_COOKIES", False, env))
@@ -1137,7 +1149,7 @@ def wsgi_app(environ, start_response):
             ensure_ready()
         except (db.DatabaseNotConfigured, db.DatabaseUnavailable) as e:
             print(f"ERROR: {e}", flush=True)
-            req.send_json({"error": e.code}, 503)
+            req.send_json(database_problem(e), 503)
         except Exception:
             traceback.print_exc()
             req.send_json({"error": "server_error"}, 503)
@@ -1266,11 +1278,73 @@ TESTER_REVIEWS = [
     ),
 ]
 
-# Fictional "sample foodies" whose only job is to like the tester's reviews (they can't log in).
+# Fictional "sample foodies": they like the tester's reviews and write a few of their own (they can't log in).
 DEMO_FANS = [("demo_nok", "Nok"), ("demo_pim", "Pim"), ("demo_ton", "Ton"), ("demo_mali", "Mali"),
              ("demo_beam", "Beam"), ("demo_ploy", "Ploy"), ("demo_arm", "Arm"), ("demo_fah", "Fah"),
              ("demo_nan", "Nan"), ("demo_pete", "Pete"), ("demo_gift", "Gift"), ("demo_mint", "Mint")]
 TESTER_LIKES = [12, 10, 9, 8, 7, 6]  # per review, 52 in total, comfortably over FAMOUS_LIKES
+
+# Eight more sample reviews, one for each of eight different sample foodies, so the feed and the
+# category filters look lively. The vendors are fictional.
+MORE_REVIEWS = [
+    dict(
+        author="demo_pim", restaurant_name="Auntie Dao's Fried Chicken Rice", area="Hat Yai, Songkhla",
+        menu_item="Khao Man Gai Tod (fried chicken rice) + nam jim", category="khao_man_gai", rating=5, price_thb=60,
+        payments=["qr"], open_days=DAYS, open_time="07:00", close_time="15:00", spice=1,
+        body="Shatteringly crisp skin, juicy meat, and rice that smells of chicken fat and garlic. The sweet-spicy "
+             "dipping sauce is the reason to come. Eat it at the plastic table next to the cart.",
+    ),
+    dict(
+        author="demo_nok", restaurant_name="Uncle Chai's Chicken Rice Cart", area="Ratchada, Bangkok",
+        menu_item="Khao Man Gai Tom (poached chicken) + clear soup", category="khao_man_gai", rating=4, price_thb=50,
+        payments=["cash_only"], open_days=DAYS[:6], open_time="06:30", close_time="12:30", spice=0,
+        body="Plain, honest and comforting: tender chicken, fragrant rice, a bowl of mild winter-melon soup. Ask for "
+             "extra ginger sauce if you like a kick. Gone by half past twelve, so go early.",
+    ),
+    dict(
+        author="demo_ton", restaurant_name="Wok Fire Corner", area="Sukhumvit Soi 22, Bangkok",
+        menu_item="Pad Kra Pao Moo Krob (crispy pork) + fried egg", category="kra_pao", rating=5, price_thb=70,
+        payments=["qr", "card"], open_days=DAYS, open_time="11:00", close_time="21:00", spice=3,
+        body="Crackling pork belly in a screaming-hot basil stir fry, with a runny egg to calm it down. Order it "
+             "'phet mak' and bring a cold drink. The queue moves faster than it looks.",
+    ),
+    dict(
+        author="demo_mali", restaurant_name="Basil Brothers Night Cart", area="Ratchathewi, Bangkok",
+        menu_item="Pad Kra Pao Nuea (beef) rad khao", category="kra_pao", rating=4, price_thb=65,
+        payments=["cash_only"], open_days=DAYS[:6], open_time="17:00", close_time="00:30", spice=2,
+        body="Thin-sliced beef, loads of holy basil and a flame taller than the cook. Perfect after a long day. "
+             "Cash only, and it stays open past midnight from Monday to Saturday.",
+    ),
+    dict(
+        author="demo_beam", restaurant_name="Rolled Noodle Corner", area="Yaowarat, Bangkok",
+        menu_item="Guay Jub Nam Khon (rolled rice noodle soup)", category="noodles", rating=4, price_thb=60,
+        payments=["cash_only"], open_days=DAYS, open_time="16:00", close_time="23:00", spice=1,
+        body="Peppery broth, curly rolled noodles, crispy pork belly and a soft egg. Warming on a rainy evening "
+             "and ready in two minutes. Add the pickled chili for sparkle.",
+    ),
+    dict(
+        author="demo_ploy", restaurant_name="Pink Noodle Lady", area="Chonburi Market",
+        menu_item="Yen Ta Fo (pink noodle soup) with fish balls", category="noodles", rating=4, price_thb=55,
+        payments=["qr"], open_days=DAYS[1:], open_time="09:00", close_time="15:00", spice=1,
+        body="Tangy, sweet, slightly funky pink broth with squid, fish balls and morning glory. It looks wild and "
+             "tastes better. A good first try if you want something different.",
+    ),
+    dict(
+        author="demo_arm", restaurant_name="Uncle Daeng's Braised Pork Leg", area="Phra Nakhon, Bangkok",
+        menu_item="Khao Kha Moo (braised pork leg on rice) + boiled egg", category="other", rating=5, price_thb=60,
+        payments=["cash_only"], open_days=DAYS, open_time="10:00", close_time="19:00", spice=0,
+        body="Pork leg braised for hours until it falls apart, sweet-salty gravy, pickled mustard greens and a "
+             "perfect egg. Spoon the garlic-chili vinegar over it. A bargain for sixty baht.",
+    ),
+    dict(
+        author="demo_fah", restaurant_name="Little Coconut Pancake Stall", area="Old Town, Phuket",
+        menu_item="Kanom Krok (coconut pancakes) x10", category="other", rating=5, price_thb=30,
+        payments=["cash_only"], open_days=DAYS[2:], open_time="15:00", close_time="20:00", spice=0,
+        body="Crispy edges, a creamy coconut middle, and scallions or sweet corn on top. Ten fresh from the pan "
+             "disappear very quickly. Open Wednesday to Sunday afternoons only.",
+    ),
+]
+MORE_LIKES = [5, 4, 4, 3, 3, 2, 2, 1]  # per review, a few each: nobody here becomes famous
 
 
 def _add_sample_review(con, user_id: int, s: dict, created: int) -> int:
@@ -1285,6 +1359,21 @@ def _add_sample_review(con, user_id: int, s: dict, created: int) -> int:
     ).fetchone()[0]
 
 
+def ensure_demo_fans(con, now: int) -> dict:
+    """The fictional sample foodies as {username: id}, created when missing."""
+    names = [u for u, _ in DEMO_FANS]
+    marks = ",".join("?" * len(names))
+    taken = {r[0] for r in con.execute(f"SELECT lower(username) FROM users WHERE lower(username) IN ({marks})", names)}
+    new_fans = [(u, n) for u, n in DEMO_FANS if u not in taken]
+    if new_fans:
+        con.execute(
+            "INSERT INTO users(username, display_name, pw_hash, bio, created_at) VALUES "
+            + ",".join(["(?,?,NULL,?,?)"] * len(new_fans)),
+            [x for u, n in new_fans for x in (u, n, "Sample foodie account (demo data: fictional reviews and likes).", now - 20 * 86400)],
+        )
+    return {r[0]: r[1] for r in con.execute(f"SELECT lower(username), id FROM users WHERE lower(username) IN ({marks})", names)}
+
+
 def seed_version(con) -> int:
     value = db.get_meta(con, "seed_version")
     if value is not None:
@@ -1297,7 +1386,8 @@ def seed_version(con) -> int:
 def seed(con) -> bool:
     """Add the demo profiles. Each demo user is created only if missing, and only until the
     seed version is recorded, so deleting a demo review never brings it back."""
-    if seed_version(con) >= SEED_VERSION:
+    version = seed_version(con)
+    if version >= SEED_VERSION:
         return False
 
     def exists(name: str) -> bool:
@@ -1320,17 +1410,8 @@ def seed(con) -> bool:
                 "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,0,?) RETURNING id",
                 ("test_blogger", "Test Eater", TESTER_BIO, now - 30 * 86400),
             ).fetchone()[0]
-            names = [u for u, _ in DEMO_FANS]
-            marks = ",".join("?" * len(names))
-            taken = {r[0] for r in con.execute(f"SELECT lower(username) FROM users WHERE lower(username) IN ({marks})", names)}
-            new_fans = [(u, n) for u, n in DEMO_FANS if u not in taken]
-            if new_fans:
-                con.execute(
-                    "INSERT INTO users(username, display_name, pw_hash, bio, created_at) VALUES "
-                    + ",".join(["(?,?,NULL,?,?)"] * len(new_fans)),
-                    [x for u, n in new_fans for x in (u, n, "Sample foodie account used for demo likes.", now - 20 * 86400)],
-                )
-            fans = [r[0] for r in con.execute(f"SELECT id FROM users WHERE lower(username) IN ({marks}) ORDER BY id", names)]
+            ids = ensure_demo_fans(con, now)
+            fans = [ids[u] for u, _ in DEMO_FANS]
             likes = []
             for i, s in enumerate(TESTER_REVIEWS):
                 rid = _add_sample_review(con, tester, s, now - i * 5400 - 1800)
@@ -1340,6 +1421,21 @@ def seed(con) -> bool:
                     "INSERT INTO likes(user_id, review_id) VALUES " + ",".join(["(?,?)"] * len(likes)) + " ON CONFLICT DO NOTHING",
                     [x for pair in likes for x in pair],
                 )
+            con.commit()
+            added = True
+        if version < 3:  # a database seeded before these existed gets just this part
+            ids = ensure_demo_fans(con, now)
+            fans = [ids[u] for u, _ in DEMO_FANS]
+            likes = []
+            for i, s in enumerate(MORE_REVIEWS):
+                author = ids[s["author"]]
+                rid = _add_sample_review(con, author, {k: v for k, v in s.items() if k != "author"}, now - i * 4200 - 900)
+                others = [f for f in fans if f != author]
+                likes += [(others[(i * 3 + k) % len(others)], rid) for k in range(MORE_LIKES[i])]
+            con.execute(
+                "INSERT INTO likes(user_id, review_id) VALUES " + ",".join(["(?,?)"] * len(likes)) + " ON CONFLICT DO NOTHING",
+                [x for pair in likes for x in pair],
+            )
             con.commit()
             added = True
     except db.integrity_errors:

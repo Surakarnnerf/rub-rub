@@ -321,6 +321,28 @@ class AppTest(unittest.TestCase):
         self.assertTrue(star.request("GET", "/api/users/nina_star")[1]["user"]["is_famous"])
         self.assertIn("nina_star", [u["username"] for u in star.request("GET", "/api/users?limit=20")[1]["users"]])
 
+    def test_sample_catalogue_is_varied_enough_to_show_every_filter(self):
+        con = server.connect()
+        try:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM reviews WHERE is_sample = 1").fetchone()[0], 22)
+            self.assertEqual(con.execute("SELECT COUNT(DISTINCT user_id) FROM reviews WHERE is_sample = 1").fetchone()[0], 10)
+            for cat in server.CATEGORIES:
+                n = con.execute("SELECT COUNT(*) FROM reviews WHERE is_sample = 1 AND category = ?", (cat,)).fetchone()[0]
+                self.assertGreaterEqual(n, 3, cat)
+            for column in ("cash_only", "pay_qr", "pay_card"):  # cards are rare at street stalls, so 4 is realistic
+                self.assertGreaterEqual(con.execute(f"SELECT COUNT(*) FROM reviews WHERE is_sample = 1 AND {column} = 1").fetchone()[0], 4, column)
+            self.assertGreaterEqual(con.execute("SELECT COUNT(DISTINCT rating) FROM reviews WHERE is_sample = 1").fetchone()[0], 2)
+        finally:
+            con.close()
+        c = self.client()
+        self.assertEqual(c.request("GET", "/api/users/demo_pim")[1]["user"]["review_count"], 1)
+        pim = c.request("GET", "/api/reviews?user=demo_pim")[1]["reviews"][0]
+        self.assertEqual((pim["category"], pim["is_sample"], pim["author"]["display_name"]), ("khao_man_gai", True, "Pim"))
+        self.assertGreater(pim["likes"], 0)
+        famous = [u["username"] for u in c.request("GET", "/api/users?limit=20")[1]["users"]]
+        self.assertIn("test_blogger", famous)
+        self.assertFalse([u for u in famous if u.startswith("demo_")])  # the extra foodies stay ordinary
+
     def test_seed_is_not_repeated(self):
         con = server.connect()
         try:
@@ -717,6 +739,30 @@ class DatabaseLayerTest(unittest.TestCase):
     def test_related_variable_names_never_include_values(self):
         names = db.related_variable_names({"STORAGE_URL": "postgres://user:secret@h/db", "PATH": "x", "NEON_PROJECT_ID": "p"})
         self.assertEqual(names, ["NEON_PROJECT_ID", "STORAGE_URL"])
+        described = db.describe_variables({"STORAGE_URL": "postgres://user:secret@h/db", "OTHER_URL": "https://x/y", "PATH": "p"})
+        self.assertEqual(described, ["OTHER_URL=other", "STORAGE_URL=postgres-url"])
+        self.assertNotIn("secret", " ".join(described))
+
+    def test_address_is_found_inside_quotes_or_a_pasted_psql_command(self):
+        pick = lambda value: db.postgres_url_from_env({"DATABASE_URL": value})
+        self.assertEqual(pick("postgresql://u:p@h/db?sslmode=require"), "postgresql://u:p@h/db?sslmode=require")
+        self.assertEqual(pick('"postgresql://u:p@h/db"'), "postgresql://u:p@h/db")
+        self.assertEqual(pick("'postgres://u:p@h/db'"), "postgres://u:p@h/db")
+        self.assertEqual(pick("psql 'postgresql://u:p@h/db?sslmode=require'"), "postgresql://u:p@h/db?sslmode=require")
+        self.assertIsNone(pick("https://example.com"))
+        self.assertIsNone(pick(""))
+
+    def test_address_is_built_from_the_separate_pg_variables_on_vercel_only(self):
+        parts = {"PGHOST": "ep-cool-123-pooler.ap-southeast-1.aws.neon.tech", "PGUSER": "neondb_owner",
+                 "PGPASSWORD": "p@ss/w:rd#1", "PGDATABASE": "neondb"}
+        url = db.postgres_url_from_env(parts, any_name=True)
+        self.assertEqual(url, "postgresql://neondb_owner:p%40ss%2Fw%3Ard%231@ep-cool-123-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
+        self.assertIsNone(db.postgres_url_from_env(parts))  # on a PC the PG* variables are not guessed at
+        self.assertIsNone(db.postgres_url_from_env({"PGHOST": "h", "PGUSER": "u"}, any_name=True))  # incomplete
+        with_port = db.postgres_url_from_env(dict(parts, PGPORT="6543", PGSSLMODE="verify-full"), any_name=True)
+        self.assertIn("@ep-cool-123-pooler.ap-southeast-1.aws.neon.tech:6543/neondb?sslmode=verify-full", with_port)
+        # a complete URL variable always beats the assembled one
+        self.assertEqual(db.postgres_url_from_env(dict(parts, STORAGE_URL="postgres://real/db"), any_name=True), "postgres://real/db")
 
     def test_placeholders_become_psycopg_style(self):
         self.assertEqual(db._pg_sql("SELECT 1 WHERE a = ? AND b LIKE '%x' AND c = ?"),
@@ -802,6 +848,30 @@ class VercelEnvironmentTest(unittest.TestCase):
     def test_vercel_finds_a_database_whatever_prefix_the_integration_used(self):
         server.apply_environment({"VERCEL": "1", "STORAGE_URL": "postgres://u:p@host/db?sslmode=require"})
         self.assertEqual(db.engine(), "postgres")
+
+    def test_a_site_without_a_database_address_tells_its_owner_which_settings_it_saw(self):
+        """The 503 lists the NAMES of related settings, so the owner can see what is missing without logs."""
+        from unittest import mock
+
+        def call(path):
+            out = {}
+            environ = {"REQUEST_METHOD": "GET", "PATH_INFO": path, "QUERY_STRING": "", "wsgi.input": io.BytesIO()}
+            body = b"".join(server.wsgi_app(environ, lambda status, headers: out.update(status=status)))
+            return out["status"], json.loads(body)
+
+        old_ready = server._ready
+        server._ready = False  # a cold start
+        try:
+            fake_vercel = {"VERCEL": "1", "STORAGE_URL": "https://secret.example/token123", "PGHOST": "h"}
+            with mock.patch.dict(os.environ, fake_vercel, clear=True):  # isolated from this PC's own settings
+                status, body = call("/healthz")
+        finally:
+            server._ready = old_ready
+        self.assertTrue(status.startswith("503"), status)
+        self.assertEqual(body["error"], "database_not_configured")
+        self.assertEqual(body["variables_seen"], ["PGHOST=other", "STORAGE_URL=other"])
+        self.assertNotIn("token123", json.dumps(body))
+        self.assertNotIn("secret.example", json.dumps(body))
 
     def test_the_error_names_nearby_variables_but_never_leaks_values(self):
         with self.assertRaises(db.DatabaseNotConfigured) as ctx:
@@ -1024,6 +1094,35 @@ class UpgradeTest(unittest.TestCase):
                     self.assertEqual(con.execute(
                         "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id WHERE u.username = 'test_blogger'").fetchone()[0], 6)
                     self.assertFalse(server.seed(con))
+                finally:
+                    con.close()
+            finally:
+                server.configure(old_dir)
+
+    def test_database_seeded_before_the_extra_reviews_gets_just_those(self):
+        old_dir = server.DATA_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                server.configure(tmp)
+                server.init_db()
+                con = server.connect()
+                try:
+                    count = lambda sql: con.execute(sql).fetchone()[0]
+                    self.assertTrue(server.seed(con))
+                    self.assertEqual(count("SELECT COUNT(*) FROM reviews"), 22)
+                    # make it look like a site that was seeded when only Claude and Test Eater existed
+                    con.execute("DELETE FROM reviews WHERE user_id IN (SELECT id FROM users WHERE username LIKE 'demo_%')")
+                    db.set_meta(con, "seed_version", 2)
+                    con.commit()
+                    self.assertEqual(count("SELECT COUNT(*) FROM reviews"), 14)
+                    self.assertTrue(server.seed(con))  # the next start adds only the new part
+                    self.assertEqual(count("SELECT COUNT(*) FROM reviews"), 22)
+                    self.assertEqual(count("SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id WHERE u.username = 'claude'"), 8)
+                    self.assertEqual(count("SELECT COUNT(*) FROM users WHERE username = 'claude'"), 1)
+                    self.assertEqual(count("SELECT COUNT(*) FROM users WHERE username LIKE 'demo_%'"), 12)  # no duplicate foodies
+                    self.assertFalse(server.seed(con))  # and never again
+                    self.assertEqual(count("SELECT COUNT(*) FROM reviews"), 22)
+                    self.assertEqual(db.get_meta(con, "seed_version"), str(server.SEED_VERSION))
                 finally:
                     con.close()
             finally:
