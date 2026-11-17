@@ -1,0 +1,1211 @@
+#!/usr/bin/env python3
+"""Rub rub - Thai street food reviews.
+
+Zero-dependency server (Python 3.9+, standard library only).
+
+    python server.py                       # http://127.0.0.1:8000
+    python server.py --host 0.0.0.0        # share on your local network
+    python server.py --reset-password NAME # set/reset a user's password
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import sqlite3
+import sys
+import threading
+import time
+import traceback
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "rubrub.db"
+UPLOAD_DIR = DATA_DIR / "uploads"
+
+
+def configure(data_dir) -> None:
+    """Point the app at another data folder (used by the tests)."""
+    global DATA_DIR, DB_PATH, UPLOAD_DIR
+    DATA_DIR = Path(data_dir).resolve()
+    DB_PATH = DATA_DIR / "rubrub.db"
+    UPLOAD_DIR = DATA_DIR / "uploads"
+
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+SESSION_COOKIE = "rr_session"
+SESSION_TTL = 30 * 24 * 3600
+MAX_JSON = 64 * 1024
+MAX_UPLOAD = 3 * 1024 * 1024
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+PAYMENTS = ("cash_only", "qr", "card")
+CATEGORIES = ("khao_man_gai", "kra_pao", "noodles", "other")  # ข้าวมันไก่, ข้าวกระเพรา, ก๋วยเตี๋ยว, อื่นๆ
+FAMOUS_LIKES = 25  # likes received (on all their reviews) before a reviewer earns the "famous" badge
+SEED_VERSION = 2
+CATEGORY_KEYWORDS = (  # checked in order; keep in sync with guessCategory() in static/js/app.js
+    ("khao_man_gai", ("khao man gai", "kao man gai", "man gai", "hainan", "ข้าวมันไก่")),
+    ("kra_pao", ("kra pao", "kaprao", "krapow", "ka prao", "กะเพรา", "กระเพรา")),
+    ("noodles", ("noodle", "kuay teow", "guay teow", "kway teow", "ba mee", "bamee", "pad thai", "khao soi", "pad see ew",
+                 "rad na", "wonton", "ก๋วยเตี๋ยว", "บะหมี่", "เส้น", "ผัดไทย", "ข้าวซอย", "ราดหน้า")),
+)
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+PHOTO_RE = re.compile(r"^[0-9a-f]{24}\.(jpg|png|webp)$")
+CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": (
+        "default-src 'self'; img-src 'self' data: blob:; "
+        "style-src 'self' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; script-src 'self'; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
+        "form-action 'self'"
+    ),
+}
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    username     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    display_name TEXT NOT NULL,
+    pw_hash      TEXT,
+    bio          TEXT NOT NULL DEFAULT '',
+    is_featured  INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    restaurant_name TEXT NOT NULL,
+    area            TEXT NOT NULL DEFAULT '',
+    menu_item       TEXT NOT NULL,
+    category        TEXT NOT NULL DEFAULT 'other',
+    rating          INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    price_thb       INTEGER NOT NULL CHECK (price_thb BETWEEN 1 AND 10000),
+    cash_only       INTEGER NOT NULL DEFAULT 0,
+    pay_qr          INTEGER NOT NULL DEFAULT 0,
+    pay_card        INTEGER NOT NULL DEFAULT 0,
+    open_days       TEXT NOT NULL,
+    open_time       TEXT NOT NULL,
+    close_time      TEXT NOT NULL,
+    spice           INTEGER NOT NULL DEFAULT 0 CHECK (spice BETWEEN 0 AND 3),
+    body            TEXT NOT NULL DEFAULT '',
+    photo           TEXT,
+    is_sample       INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS likes (
+    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, review_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(user_id);
+CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);
+"""
+
+REVIEW_SELECT = """
+SELECT r.*, u.username, u.display_name, u.is_featured,
+       (SELECT COUNT(*) FROM likes l2 JOIN reviews r2 ON r2.id = l2.review_id WHERE r2.user_id = u.id) AS author_likes,
+       (SELECT COUNT(*) FROM likes l WHERE l.review_id = r.id) AS like_count,
+       EXISTS(SELECT 1 FROM likes l WHERE l.review_id = r.id AND l.user_id = ?) AS liked
+FROM reviews r JOIN users u ON u.id = r.user_id
+"""
+
+SORTS = {
+    "new": "r.created_at DESC, r.id DESC",
+    "top": "r.rating DESC, like_count DESC, r.id DESC",
+    "cheap": "r.price_thb ASC, r.id DESC",
+    "liked": "like_count DESC, r.id DESC",
+}
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+class ApiError(Exception):
+    def __init__(self, status: int, code: str, fields: dict | None = None):
+        super().__init__(code)
+        self.status = status
+        self.code = code
+        self.fields = fields or {}
+
+
+def connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def guess_category(text: str) -> str:
+    s = (text or "").lower()
+    for cat, words in CATEGORY_KEYWORDS:
+        if any(w in s for w in words):
+            return cat
+    return "other"
+
+
+def init_db() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    con = connect()
+    try:
+        con.execute("PRAGMA journal_mode = WAL")
+        con.executescript(SCHEMA)
+        # upgrade databases created before categories existed
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(reviews)")}
+        if "category" not in cols:
+            con.execute("ALTER TABLE reviews ADD COLUMN category TEXT NOT NULL DEFAULT 'other'")
+            for r in con.execute("SELECT id, menu_item FROM reviews").fetchall():
+                con.execute("UPDATE reviews SET category = ? WHERE id = ?", (guess_category(r["menu_item"]), r["id"]))
+        con.commit()
+    finally:
+        con.close()
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, salt_hex, dk_hex = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        dk = hashlib.scrypt(
+            password.encode("utf-8"), salt=bytes.fromhex(salt_hex), n=2 ** 14, r=8, p=1, dklen=32
+        )
+        return hmac.compare_digest(dk.hex(), dk_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+DUMMY_HASH = hash_password(secrets.token_hex(8))  # equalises timing for unknown users
+
+_rate_lock = threading.Lock()
+RATE: dict[str, list[float]] = {}
+
+
+def rate_ok(key: str, limit: int, window: int) -> bool:
+    """Record one attempt for `key`; False once `limit` attempts happened within `window` s."""
+    now = time.time()
+    with _rate_lock:
+        if len(RATE) > 5000:
+            for k in [k for k, v in RATE.items() if not v or now - v[-1] > 3600]:
+                del RATE[k]
+        hits = [t for t in RATE.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            RATE[key] = hits
+            return False
+        hits.append(now)
+        RATE[key] = hits
+        return True
+
+
+def clean_line(value) -> str:
+    if value is None:
+        return ""
+    return " ".join(CTRL_RE.sub("", str(value)).split())
+
+
+def clean_text(value) -> str:
+    s = CTRL_RE.sub("", str(value or "")).replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def as_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and re.fullmatch(r"\d{1,6}", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def sniff_image(data: bytes) -> str | None:
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def payment_columns(payments) -> dict:
+    return {
+        "cash_only": int("cash_only" in payments),
+        "pay_qr": int("qr" in payments),
+        "pay_card": int("card" in payments),
+    }
+
+
+def delete_photo_if_unused(name: str | None) -> None:
+    if not name or not PHOTO_RE.match(name):
+        return
+    con = connect()
+    try:
+        if con.execute("SELECT 1 FROM reviews WHERE photo = ? LIMIT 1", (name,)).fetchone():
+            return
+    finally:
+        con.close()
+    try:
+        (UPLOAD_DIR / name).unlink()
+    except OSError:
+        pass
+
+
+def cleanup_orphan_uploads() -> None:
+    con = connect()
+    try:
+        used = {r[0] for r in con.execute("SELECT photo FROM reviews WHERE photo IS NOT NULL")}
+    finally:
+        con.close()
+    cutoff = time.time() - 24 * 3600
+    for f in UPLOAD_DIR.iterdir():
+        try:
+            if f.is_file() and f.name not in used and f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------
+def validate_review(d: dict) -> dict:
+    errors: dict[str, str] = {}
+    out: dict = {}
+
+    def text(field: str, lo: int, hi: int, required: bool = True):
+        v = clean_line(d.get(field))
+        if not v:
+            if required:
+                errors[field] = "required"
+        elif len(v) < lo:
+            errors[field] = "too_short"
+        elif len(v) > hi:
+            errors[field] = "too_long"
+        out[field] = v
+
+    text("restaurant_name", 2, 80)
+    text("area", 0, 80, required=False)
+    text("menu_item", 2, 80)
+
+    category = d.get("category")
+    if category in (None, ""):
+        category = guess_category(out["menu_item"])  # API clients may omit it
+    elif not isinstance(category, str) or category not in CATEGORIES:
+        errors["category"] = "invalid"
+        category = "other"
+    out["category"] = category
+
+    rating = as_int(d.get("rating"))
+    if rating is None and d.get("rating") in (None, ""):
+        errors["rating"] = "required"
+    elif rating is None or not 1 <= rating <= 5:
+        errors["rating"] = "invalid"
+    out["rating"] = rating
+
+    price = as_int(d.get("price_thb"))
+    if price is None and d.get("price_thb") in (None, ""):
+        errors["price_thb"] = "required"
+    elif price is None or not 1 <= price <= 10000:
+        errors["price_thb"] = "invalid"
+    out["price_thb"] = price
+
+    spice = as_int(d.get("spice", 0) if d.get("spice") is not None else 0)
+    if spice is None or not 0 <= spice <= 3:
+        errors["spice"] = "invalid"
+        spice = 0
+    out["spice"] = spice
+
+    payments = d.get("payments")
+    if not isinstance(payments, list) or not payments:
+        errors["payments"] = "pick_one"
+        payments = []
+    elif not all(isinstance(p, str) and p in PAYMENTS for p in payments):
+        errors["payments"] = "invalid"
+        payments = []
+    elif "cash_only" in payments and len(set(payments)) > 1:
+        errors["payments"] = "cash_only_exclusive"
+        payments = []
+    out.update(payment_columns(payments))
+
+    days = d.get("open_days")
+    if not isinstance(days, list) or not days:
+        errors["open_days"] = "pick_one"
+        days = []
+    elif not all(isinstance(x, str) and x in DAYS for x in days):
+        errors["open_days"] = "invalid"
+        days = []
+    out["open_days"] = ",".join(x for x in DAYS if x in days)
+
+    for field in ("open_time", "close_time"):
+        v = d.get(field)
+        if not isinstance(v, str) or not TIME_RE.match(v):
+            errors[field] = "required" if v in (None, "") else "invalid"
+        out[field] = v
+    if "open_time" not in errors and "close_time" not in errors and out["open_time"] == out["close_time"]:
+        errors["close_time"] = "same_time"
+
+    body = clean_text(d.get("body"))
+    if len(body) > 1000:
+        errors["body"] = "too_long"
+    out["body"] = body
+
+    photo = d.get("photo")
+    if photo in (None, ""):
+        out["photo"] = None
+    elif isinstance(photo, str) and PHOTO_RE.match(photo) and (UPLOAD_DIR / photo).is_file():
+        out["photo"] = photo
+    else:
+        errors["photo"] = "invalid"
+        out["photo"] = None
+
+    if errors:
+        raise ApiError(400, "validation", errors)
+    return out
+
+
+# --------------------------------------------------------------------------
+# JSON shaping
+# --------------------------------------------------------------------------
+def me_json(u) -> dict | None:
+    if not u:
+        return None
+    return {"username": u["username"], "display_name": u["display_name"], "is_featured": bool(u["is_featured"])}
+
+
+def review_json(r) -> dict:
+    payments = [name for name, col in (("cash_only", "cash_only"), ("qr", "pay_qr"), ("card", "pay_card")) if r[col]]
+    return {
+        "id": r["id"],
+        "restaurant_name": r["restaurant_name"],
+        "area": r["area"],
+        "menu_item": r["menu_item"],
+        "category": r["category"],
+        "rating": r["rating"],
+        "price_thb": r["price_thb"],
+        "payments": payments,
+        "open_days": r["open_days"].split(","),
+        "open_time": r["open_time"],
+        "close_time": r["close_time"],
+        "spice": r["spice"],
+        "body": r["body"],
+        "photo": f"/uploads/{r['photo']}" if r["photo"] else None,
+        "is_sample": bool(r["is_sample"]),
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+        "likes": r["like_count"],
+        "liked": bool(r["liked"]),
+        "author": {
+            "username": r["username"],
+            "display_name": r["display_name"],
+            "is_featured": bool(r["is_featured"]),
+            "is_famous": r["author_likes"] >= FAMOUS_LIKES,
+        },
+    }
+
+
+def user_json(u, review_count: int, avg, likes_received: int) -> dict:
+    return {
+        "username": u["username"],
+        "display_name": u["display_name"],
+        "bio": u["bio"],
+        "is_featured": bool(u["is_featured"]),
+        "is_famous": likes_received >= FAMOUS_LIKES,
+        "famous_at": FAMOUS_LIKES,
+        "created_at": u["created_at"],
+        "review_count": review_count,
+        "avg_rating": round(avg, 1) if avg is not None else None,
+        "likes_received": likes_received,
+    }
+
+
+def like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def qstr(q: dict, key: str, default: str = "") -> str:
+    vals = q.get(key)
+    return vals[0] if vals else default
+
+
+def qint(q: dict, key: str, default: int, lo: int, hi: int) -> int:
+    try:
+        v = int(qstr(q, key))
+    except ValueError:
+        return default
+    return max(lo, min(hi, v))
+
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
+ROUTES: list = []
+
+
+def route(method: str, pattern: str):
+    def deco(fn):
+        ROUTES.append((method, re.compile("^" + pattern + "$"), fn))
+        return fn
+
+    return deco
+
+
+def start_session(h: "Handler", user_id: int) -> None:
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    h.con.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+    h.con.execute(
+        "INSERT INTO sessions(token_hash, user_id, expires_at) VALUES(?,?,?)",
+        (hashlib.sha256(token.encode()).hexdigest(), user_id, now + SESSION_TTL),
+    )
+    h.cookies.append(f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")
+
+
+@route("GET", "/api/me")
+def api_me(h, q):
+    return {"user": me_json(h.current_user())}
+
+
+@route("POST", "/api/signup")
+def api_signup(h, q):
+    if not rate_ok(f"signup:{h.client_address[0]}", 20, 3600):
+        raise ApiError(429, "rate_limited")
+    d = h.read_json()
+    errors = {}
+    username = str(d.get("username") or "").strip()
+    if not USERNAME_RE.match(username):
+        errors["username"] = "invalid_username"
+    display = clean_line(d.get("display_name")) or username
+    if len(display) > 40:
+        errors["display_name"] = "too_long"
+    password = d.get("password")
+    if not isinstance(password, str) or len(password) < 8:
+        errors["password"] = "password_short"
+    elif len(password) > 128:
+        errors["password"] = "too_long"
+    if errors:
+        raise ApiError(400, "validation", errors)
+    if h.con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+        raise ApiError(409, "validation", {"username": "username_taken"})
+    try:
+        cur = h.con.execute(
+            "INSERT INTO users(username, display_name, pw_hash, created_at) VALUES(?,?,?,?)",
+            (username, display, hash_password(password), int(time.time())),
+        )
+    except sqlite3.IntegrityError:
+        raise ApiError(409, "validation", {"username": "username_taken"})
+    start_session(h, cur.lastrowid)
+    user = h.con.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return 201, {"user": me_json(user)}
+
+
+@route("POST", "/api/login")
+def api_login(h, q):
+    d = h.read_json()
+    username = str(d.get("username") or "").strip()
+    password = d.get("password")
+    key = f"login:{h.client_address[0]}:{username.lower()}"
+    if not rate_ok(key, 8, 600):
+        raise ApiError(429, "rate_limited")
+    row = h.con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    stored = row["pw_hash"] if row and row["pw_hash"] else DUMMY_HASH
+    good = isinstance(password, str) and verify_password(password, stored)
+    if not (good and row and row["pw_hash"]):
+        raise ApiError(401, "bad_credentials")
+    with _rate_lock:
+        RATE.pop(key, None)
+    start_session(h, row["id"])
+    return {"user": me_json(row)}
+
+
+@route("POST", "/api/logout")
+def api_logout(h, q):
+    token = h.session_token()
+    if token:
+        h.con.execute("DELETE FROM sessions WHERE token_hash = ?", (hashlib.sha256(token.encode()).hexdigest(),))
+    h.cookies.append(f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+    return {"ok": True}
+
+
+@route("GET", "/api/reviews")
+def api_reviews(h, q):
+    me = h.current_user()
+    me_id = me["id"] if me else -1
+    where, args = [], []
+
+    text = qstr(q, "q").strip()[:80]
+    if text:
+        like = "%" + like_escape(text) + "%"
+        where.append(
+            "(r.restaurant_name LIKE ? ESCAPE '\\' OR r.menu_item LIKE ? ESCAPE '\\' "
+            "OR r.area LIKE ? ESCAPE '\\' OR r.body LIKE ? ESCAPE '\\')"
+        )
+        args += [like] * 4
+    pay = qstr(q, "payment")
+    if pay == "cash_only":
+        where.append("r.cash_only = 1")
+    elif pay == "qr":
+        where.append("r.pay_qr = 1")
+    elif pay == "card":
+        where.append("r.pay_card = 1")
+    category = qstr(q, "category")
+    if category in CATEGORIES:
+        where.append("r.category = ?")
+        args.append(category)
+    min_rating = qint(q, "min_rating", 0, 0, 5)
+    if min_rating:
+        where.append("r.rating >= ?")
+        args.append(min_rating)
+    user = qstr(q, "user").strip()
+    if user:
+        where.append("u.username = ?")
+        args.append(user)
+    if qstr(q, "featured") == "1":
+        where.append("u.is_featured = 1")
+
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    order = SORTS.get(qstr(q, "sort"), SORTS["new"])
+    limit = qint(q, "limit", 12, 1, 50)
+    offset = qint(q, "offset", 0, 0, 100000)
+
+    total = h.con.execute(
+        "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id" + clause, args
+    ).fetchone()[0]
+    rows = h.con.execute(
+        REVIEW_SELECT + clause + f" ORDER BY {order} LIMIT ? OFFSET ?", [me_id, *args, limit, offset]
+    ).fetchall()
+    return {"reviews": [review_json(r) for r in rows], "total": total}
+
+
+def fetch_review(h, review_id: int):
+    me = h.current_user()
+    return h.con.execute(REVIEW_SELECT + " WHERE r.id = ?", (me["id"] if me else -1, review_id)).fetchone()
+
+
+@route("GET", r"/api/reviews/(\d+)")
+def api_review_get(h, q, rid):
+    row = fetch_review(h, int(rid))
+    if not row:
+        raise ApiError(404, "not_found")
+    return {"review": review_json(row)}
+
+
+REVIEW_COLUMNS = (
+    "restaurant_name", "area", "menu_item", "category", "rating", "price_thb", "cash_only", "pay_qr", "pay_card",
+    "open_days", "open_time", "close_time", "spice", "body", "photo",
+)
+
+
+@route("POST", "/api/reviews")
+def api_review_create(h, q):
+    me = h.require_user()
+    if not rate_ok(f"review:{me['id']}", 30, 3600):
+        raise ApiError(429, "rate_limited")
+    data = validate_review(h.read_json())
+    now = int(time.time())
+    cols = ("user_id", *REVIEW_COLUMNS, "created_at", "updated_at")
+    cur = h.con.execute(
+        f"INSERT INTO reviews({', '.join(cols)}) VALUES({', '.join('?' * len(cols))})",
+        [me["id"], *(data[c] for c in REVIEW_COLUMNS), now, now],
+    )
+    return 201, {"review": review_json(fetch_review(h, cur.lastrowid))}
+
+
+def owned_review(h, rid: int):
+    me = h.require_user()
+    row = h.con.execute("SELECT id, user_id, photo FROM reviews WHERE id = ?", (rid,)).fetchone()
+    if not row:
+        raise ApiError(404, "not_found")
+    if row["user_id"] != me["id"]:
+        raise ApiError(403, "forbidden")
+    return row
+
+
+@route("PUT", r"/api/reviews/(\d+)")
+def api_review_update(h, q, rid):
+    row = owned_review(h, int(rid))
+    data = validate_review(h.read_json())
+    sets = ", ".join(f"{c} = ?" for c in REVIEW_COLUMNS)
+    h.con.execute(
+        f"UPDATE reviews SET {sets}, updated_at = ? WHERE id = ?",
+        [*(data[c] for c in REVIEW_COLUMNS), int(time.time()), row["id"]],
+    )
+    if row["photo"] and row["photo"] != data["photo"]:
+        h.after_commit.append(lambda name=row["photo"]: delete_photo_if_unused(name))
+    return {"review": review_json(fetch_review(h, row["id"]))}
+
+
+@route("DELETE", r"/api/reviews/(\d+)")
+def api_review_delete(h, q, rid):
+    row = owned_review(h, int(rid))
+    h.con.execute("DELETE FROM reviews WHERE id = ?", (row["id"],))
+    h.after_commit.append(lambda name=row["photo"]: delete_photo_if_unused(name))
+    return {"ok": True}
+
+
+@route("POST", r"/api/reviews/(\d+)/like")
+def api_like(h, q, rid):
+    me = h.require_user()
+    row = h.con.execute("SELECT user_id FROM reviews WHERE id = ?", (int(rid),)).fetchone()
+    if not row:
+        raise ApiError(404, "not_found")
+    if row["user_id"] == me["id"]:
+        raise ApiError(403, "own_review")  # fame has to come from other people
+    cur = h.con.execute("DELETE FROM likes WHERE user_id = ? AND review_id = ?", (me["id"], int(rid)))
+    liked = cur.rowcount == 0
+    if liked:
+        h.con.execute("INSERT OR IGNORE INTO likes(user_id, review_id) VALUES(?,?)", (me["id"], int(rid)))
+    count = h.con.execute("SELECT COUNT(*) FROM likes WHERE review_id = ?", (int(rid),)).fetchone()[0]
+    return {"liked": liked, "likes": count}
+
+
+@route("GET", r"/api/users/([A-Za-z0-9_]{3,20})")
+def api_user(h, q, username):
+    u = h.con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if not u:
+        raise ApiError(404, "not_found")
+    stats = h.con.execute("SELECT COUNT(*) AS n, AVG(rating) AS avg FROM reviews WHERE user_id = ?", (u["id"],)).fetchone()
+    got = h.con.execute(
+        "SELECT COUNT(*) FROM likes l JOIN reviews r ON r.id = l.review_id WHERE r.user_id = ?", (u["id"],)
+    ).fetchone()[0]
+    return {"user": user_json(u, stats["n"], stats["avg"], got)}
+
+
+@route("GET", "/api/users")
+def api_famous_users(h, q):
+    """Reviewers who earned the 'famous' badge from other people's likes (the featured blogger has her own spotlight)."""
+    rows = h.con.execute(
+        """SELECT u.*, COUNT(r.id) AS n, AVG(r.rating) AS avg,
+                  (SELECT COUNT(*) FROM likes l JOIN reviews r2 ON r2.id = l.review_id WHERE r2.user_id = u.id) AS got
+           FROM users u JOIN reviews r ON r.user_id = u.id
+           WHERE u.is_featured = 0
+           GROUP BY u.id
+           HAVING got >= ?
+           ORDER BY got DESC, n DESC
+           LIMIT ?""",
+        (FAMOUS_LIKES, qint(q, "limit", 6, 1, 20)),
+    ).fetchall()
+    return {"users": [user_json(u, u["n"], u["avg"], u["got"]) for u in rows]}
+
+
+@route("GET", "/api/restaurants")
+def api_restaurants(h, q):
+    """Latest known details per restaurant, used to auto-complete the review form."""
+    rows = h.con.execute(
+        """SELECT r.* FROM reviews r
+           WHERE r.id = (SELECT r2.id FROM reviews r2
+                         WHERE lower(r2.restaurant_name) = lower(r.restaurant_name)
+                         ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
+           ORDER BY r.created_at DESC LIMIT 200"""
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "name": r["restaurant_name"],
+                "area": r["area"],
+                "payments": [n for n, c in (("cash_only", "cash_only"), ("qr", "pay_qr"), ("card", "pay_card")) if r[c]],
+                "open_days": r["open_days"].split(","),
+                "open_time": r["open_time"],
+                "close_time": r["close_time"],
+            }
+        )
+    return {"restaurants": out}
+
+
+@route("POST", "/api/upload")
+def api_upload(h, q):
+    me = h.require_user()
+    if not rate_ok(f"upload:{me['id']}", 60, 3600):
+        raise ApiError(429, "rate_limited")
+    data = h.read_body(MAX_UPLOAD)
+    ext = sniff_image(data)
+    if not ext:
+        raise ApiError(415, "bad_image")
+    name = f"{secrets.token_hex(12)}.{ext}"
+    (UPLOAD_DIR / name).write_bytes(data)
+    return 201, {"photo": name, "url": f"/uploads/{name}"}
+
+
+# --------------------------------------------------------------------------
+# HTTP handler
+# --------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    server_version = "RubRub/1.0"
+    sys_version = ""
+    timeout = 20
+
+    # -- request plumbing --------------------------------------------------
+    def do_GET(self):
+        self.handle_request()
+
+    do_HEAD = do_GET
+    do_POST = do_GET
+    do_PUT = do_GET
+    do_DELETE = do_GET
+
+    def handle_request(self):
+        self.con = None
+        self.cookies: list[str] = []
+        self.after_commit: list = []
+        self._user = False
+        self._body_read = False
+        try:
+            url = urlsplit(self.path)
+            path = unquote(url.path)
+            if path.startswith("/api/"):
+                self.con = connect()
+                try:
+                    result = self.dispatch_api(path, parse_qs(url.query))
+                    self.con.commit()
+                finally:
+                    self.con.close()
+                for fn in self.after_commit:
+                    try:
+                        fn()
+                    except Exception:  # best-effort file cleanup
+                        traceback.print_exc()
+                status, payload = result if isinstance(result, tuple) else (200, result)
+                self.send_json(payload, status)
+            else:
+                self.serve_static(path)
+        except ApiError as e:
+            self.send_json({"error": e.code, "fields": e.fields}, e.status)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
+        except Exception:
+            traceback.print_exc()
+            try:
+                self.send_json({"error": "server_error"}, 500)
+            except Exception:
+                pass
+        finally:
+            self.drain_body()
+
+    def dispatch_api(self, path: str, query: dict):
+        self.check_csrf()
+        path_matched = False
+        for method, rx, fn in ROUTES:
+            m = rx.match(path)
+            if not m:
+                continue
+            path_matched = True
+            if method == self.command or (method == "GET" and self.command == "HEAD"):
+                return fn(self, query, *m.groups())
+        raise ApiError(405, "method_not_allowed") if path_matched else ApiError(404, "not_found")
+
+    def check_csrf(self):
+        if self.command in ("GET", "HEAD"):
+            return
+        if self.headers.get("X-Requested-With") != "rubrub":
+            raise ApiError(403, "csrf")
+        origin = self.headers.get("Origin")
+        if origin and urlsplit(origin).netloc != self.headers.get("Host"):
+            raise ApiError(403, "csrf")
+
+    def read_body(self, limit: int) -> bytes:
+        self._body_read = True
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ApiError(400, "bad_request")
+        if length < 0:
+            raise ApiError(400, "bad_request")
+        if length > limit:
+            raise ApiError(413, "too_large")
+        return self.rfile.read(length) if length else b""
+
+    def read_json(self) -> dict:
+        raw = self.read_body(MAX_JSON)
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            raise ApiError(415, "bad_request")
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            raise ApiError(400, "bad_request")
+        if not isinstance(data, dict):
+            raise ApiError(400, "bad_request")
+        return data
+
+    def drain_body(self):
+        """Read an unread request body so closing the socket never resets the response."""
+        if self._body_read:
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if 0 < n <= 1_000_000:
+                self.rfile.read(n)
+        except Exception:
+            pass
+
+    # -- auth ----------------------------------------------------------------
+    def session_token(self) -> str | None:
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        jar = SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            return None
+        morsel = jar.get(SESSION_COOKIE)
+        return morsel.value if morsel and morsel.value else None
+
+    def current_user(self):
+        if self._user is not False:
+            return self._user
+        user = None
+        token = self.session_token()
+        if token and self.con is not None:
+            user = self.con.execute(
+                "SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id "
+                "WHERE s.token_hash = ? AND s.expires_at > ?",
+                (hashlib.sha256(token.encode()).hexdigest(), int(time.time())),
+            ).fetchone()
+        self._user = user
+        return user
+
+    def require_user(self):
+        user = self.current_user()
+        if not user:
+            raise ApiError(401, "unauthorized")
+        return user
+
+    # -- responses -----------------------------------------------------------
+    def send_bytes(self, status: int, body: bytes, ctype: str, extra: dict | None = None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        for c in self.cookies:
+            self.send_header("Set-Cookie", c)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def send_json(self, payload, status: int = 200):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_bytes(status, body, "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+
+    def serve_static(self, path: str):
+        if self.command not in ("GET", "HEAD"):
+            raise ApiError(405, "method_not_allowed")
+        if "\\" in path or ":" in path or "\x00" in path:
+            raise ApiError(404, "not_found")
+        if path.startswith("/uploads/"):
+            name = path[len("/uploads/"):]
+            if not PHOTO_RE.match(name):
+                raise ApiError(404, "not_found")
+            file = UPLOAD_DIR / name
+            cache = "public, max-age=31536000, immutable"
+        else:
+            file = (STATIC_DIR / (path.lstrip("/") or "index.html")).resolve()
+            if not file.is_relative_to(STATIC_DIR):
+                raise ApiError(404, "not_found")
+            if file.is_dir():
+                file = file / "index.html"
+            cache = "no-cache"
+        if not file.is_file():
+            raise ApiError(404, "not_found")
+        ctype = CONTENT_TYPES.get(file.suffix.lower(), "application/octet-stream")
+        self.send_bytes(200, file.read_bytes(), ctype, {"Cache-Control": cache})
+
+
+class RubServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second process steal the port; keep it off there.
+    allow_reuse_address = sys.platform != "win32"
+
+
+def make_server(host: str, port: int) -> RubServer:
+    return RubServer((host, port), Handler)
+
+
+# --------------------------------------------------------------------------
+# Seed data - clearly fictional vendors, labelled "sample" in the UI
+# --------------------------------------------------------------------------
+CLAUDE_BIO = (
+    "Street food obsessive. I chase wok smoke, sizzle and the longest queue on the soi, "
+    "and I always tell you if it's cash only. The reviews below are demo data: the "
+    "vendors in them are made up. ชอบกินเผ็ด!"
+)
+
+SAMPLE_REVIEWS = [
+    dict(
+        restaurant_name="Auntie Noi's Wok Cart", area="Ari, Bangkok", menu_item="Pad Kra Pao Moo Saap + fried egg",
+        rating=5, price_thb=60, payments=["cash_only"], open_days=DAYS[:6], open_time="10:30", close_time="15:00",
+        spice=3,
+        body="Smoky wok hei, a lacy-edged fried egg and holy basil by the fistful. She asks 'phet mai?' and "
+             "you say yes. Sweating through your shirt is part of the experience. Get there before 12:00 or queue.",
+    ),
+    dict(
+        restaurant_name="Som Tam Sisters", area="Old City, Chiang Mai", menu_item="Som Tam Thai with salted egg",
+        rating=4, price_thb=50, payments=["qr"], open_days=DAYS, open_time="09:00", close_time="20:00", spice=2,
+        body="Pounded to order in a clay mortar, sweet-sour-sharp with a proper crunch. Ask for 'phet nit noi' "
+             "if you are new here. The salted egg makes it creamy. QR code works, so no cash fuss.",
+    ),
+    dict(
+        restaurant_name="Moo Ping Uncle Lek", area="Phuket Old Town", menu_item="Moo Ping (3 skewers) + sticky rice",
+        rating=5, price_thb=40, payments=["cash_only"], open_days=DAYS, open_time="06:00", close_time="10:30",
+        spice=0,
+        body="Charcoal-grilled pork, honey-glazed and sticky at the edges, with warm sticky rice in a banana "
+             "leaf. The best forty baht breakfast I know. He sells out by 10, so don't be late.",
+    ),
+    dict(
+        restaurant_name="Hainan Hero Khao Man Gai", area="Silom, Bangkok", menu_item="Khao Man Gai (steamed chicken rice)",
+        rating=4, price_thb=55, payments=["qr"], open_days=DAYS[:6], open_time="07:00", close_time="14:00", spice=1,
+        body="Silky chicken, rice cooked in the broth, and a fiery ginger-chili dipping sauce that does all the "
+             "talking. Don't skip the little cup of soup. Fast service for a lunch rush.",
+    ),
+    dict(
+        restaurant_name="Boat Noodle Bridge", area="Ayutthaya", menu_item="Kuay Teow Reua (boat noodles) x3 bowls",
+        rating=4, price_thb=75, payments=["cash_only"], open_days=DAYS[1:], open_time="09:00", close_time="17:00",
+        spice=2,
+        body="Dark, rich, slightly sweet broth, tiny bowls and a tower of empties by the end. Add crispy pork "
+             "skin on top. Cash only and no English menu: just point and smile.",
+    ),
+    dict(
+        restaurant_name="Smoky Khao Soi Corner", area="Nimman, Chiang Mai", menu_item="Khao Soi Gai",
+        rating=5, price_thb=70, payments=["qr", "card"], open_days=DAYS[:6], open_time="10:00", close_time="16:00",
+        spice=2,
+        body="Creamy coconut curry broth, tender chicken, a nest of crispy noodles on top and pickled mustard "
+             "greens on the side. Squeeze the lime, add the chili oil, and thank me later.",
+    ),
+    dict(
+        restaurant_name="Midnight Pad Thai Flame", area="Yaowarat, Bangkok", menu_item="Pad Thai Goong Sod",
+        rating=4, price_thb=90, payments=["qr"], open_days=DAYS, open_time="18:00", close_time="02:00", spice=1,
+        body="Big flames, big prawns, wrapped in a thin egg net. The stall opens at 18:00 and runs until two "
+             "in the morning, which makes it my favourite post-night-market snack. Bring friends.",
+    ),
+    dict(
+        restaurant_name="Mango Mama Sticky Rice", area="Hat Yai", menu_item="Khao Niao Mamuang",
+        rating=5, price_thb=80, payments=["qr", "card"], open_days=DAYS, open_time="11:00", close_time="21:00",
+        spice=0,
+        body="Warm, coconutty sticky rice with perfectly ripe mango. The crispy mung bean sprinkle on top is "
+             "the secret. I came for dessert and stayed for seconds. A cooling finish after all that chili.",
+    ),
+]
+
+
+TESTER_BIO = (
+    "Eats three street meals a day and reviews every one. Rub rub readers keep liking these, "
+    "which is how I became a famous reviewer. (Sample profile: the vendors are made up.)"
+)
+
+TESTER_REVIEWS = [
+    dict(
+        restaurant_name="Soi 38 Crispy Kra Pao", area="Thonglor, Bangkok", menu_item="Pad Kra Pao Gai + crispy fried egg",
+        category="kra_pao", rating=5, price_thb=55, payments=["cash_only"], open_days=DAYS[:6],
+        open_time="07:00", close_time="14:00", spice=3,
+        body="Chicken minced by hand, a fistful of holy basil and chilies you can feel in your ears. The egg is "
+             "fried until the edges go lacy-crisp. I ate it standing up on the pavement and would again tomorrow.",
+    ),
+    dict(
+        restaurant_name="Uncle Somchai's Chicken Rice", area="Sathorn, Bangkok", menu_item="Khao Man Gai Pak + liver soup",
+        category="khao_man_gai", rating=4, price_thb=50, payments=["qr"], open_days=DAYS,
+        open_time="06:00", close_time="13:00", spice=1,
+        body="Tender chicken, rice that tastes of the broth, and a ginger-chili sauce with real kick. Order the "
+             "'pak' (mixed) and ask for the liver soup on the side. Fast queue, QR code accepted.",
+    ),
+    dict(
+        restaurant_name="Wonton Alley Egg Noodles", area="Yaowarat, Bangkok", menu_item="Ba Mee Moo Daeng + crispy wonton",
+        category="noodles", rating=4, price_thb=45, payments=["cash_only"], open_days=DAYS[:6],
+        open_time="08:00", close_time="16:00", spice=0,
+        body="Springy egg noodles, sweet red pork and wontons that shatter when you bite them. Add the pickled "
+             "chilies in vinegar if you want some heat. Cash only, and the lady counts change faster than a calculator.",
+    ),
+    dict(
+        restaurant_name="Tom Yum Noodle Lady", area="Khon Kaen", menu_item="Tom Yum Noodles Moo Sap (dry or soup)",
+        category="noodles", rating=5, price_thb=70, payments=["qr", "card"], open_days=DAYS[:6],
+        open_time="10:00", close_time="20:00", spice=2,
+        body="Hot, sour, a little sweet, with crushed peanuts and a squeeze of lime. I got mine as a soup and the "
+             "dry version for a friend to compare. Both are winners. This is the one I send visitors to.",
+    ),
+    dict(
+        restaurant_name="Rot Fai Night Wok", area="Night market, Bangkok", menu_item="Pad Kra Pao Talay (seafood)",
+        category="kra_pao", rating=4, price_thb=90, payments=["qr"], open_days=DAYS[3:],
+        open_time="17:00", close_time="23:30", spice=3,
+        body="Squid, prawns and mussels in a roaring-hot basil stir fry, plated on rice with a runny egg. "
+             "Only open Thursday to Sunday, so plan ahead. Worth the wait, and the wait is long after 20:00.",
+    ),
+    dict(
+        restaurant_name="Roti Rose Cart", area="Old City, Chiang Mai", menu_item="Roti Gluay (banana roti) with condensed milk",
+        category="other", rating=5, price_thb=35, payments=["cash_only"], open_days=DAYS,
+        open_time="14:00", close_time="22:00", spice=0,
+        body="She stretches the dough paper-thin, fries it in butter with banana and egg, and drizzles condensed "
+             "milk on top. The perfect cooling dessert after a spicy night. Thirty-five baht of happiness.",
+    ),
+]
+
+# Fictional "sample foodies" whose only job is to like the tester's reviews (they can't log in).
+DEMO_FANS = [("demo_nok", "Nok"), ("demo_pim", "Pim"), ("demo_ton", "Ton"), ("demo_mali", "Mali"),
+             ("demo_beam", "Beam"), ("demo_ploy", "Ploy"), ("demo_arm", "Arm"), ("demo_fah", "Fah"),
+             ("demo_nan", "Nan"), ("demo_pete", "Pete"), ("demo_gift", "Gift"), ("demo_mint", "Mint")]
+TESTER_LIKES = [12, 10, 9, 8, 7, 6]  # per review, 52 in total, comfortably over FAMOUS_LIKES
+
+
+def _add_sample_review(con: sqlite3.Connection, user_id: int, s: dict, created: int) -> int:
+    row = {k: v for k, v in s.items() if k not in ("payments", "open_days")}
+    row.setdefault("category", guess_category(s["menu_item"]))
+    row.update(payment_columns(s["payments"]))
+    row["open_days"] = ",".join(s["open_days"])
+    row.update(user_id=user_id, photo=None, is_sample=1, created_at=created, updated_at=created)
+    cols = list(row)
+    return con.execute(
+        f"INSERT INTO reviews({', '.join(cols)}) VALUES({', '.join('?' * len(cols))})", [row[c] for c in cols]
+    ).lastrowid
+
+
+def seed(con: sqlite3.Connection) -> bool:
+    """Add the demo profiles. Each demo user is created only if missing, and only until the
+    seed version is recorded, so deleting a demo review never brings it back."""
+    if con.execute("PRAGMA user_version").fetchone()[0] >= SEED_VERSION:
+        return False
+
+    def exists(name: str) -> bool:
+        return con.execute("SELECT 1 FROM users WHERE username = ?", (name,)).fetchone() is not None
+
+    now = int(time.time())
+    added = False
+    if not exists("claude"):
+        uid = con.execute(
+            "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,1,?)",
+            ("claude", "Claude", CLAUDE_BIO, now),
+        ).lastrowid
+        for i, s in enumerate(SAMPLE_REVIEWS):
+            _add_sample_review(con, uid, s, now - i * 7200)
+        added = True
+    if not exists("test_blogger"):
+        tester = con.execute(
+            "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,0,?)",
+            ("test_blogger", "Test Eater", TESTER_BIO, now - 30 * 86400),
+        ).lastrowid
+        fans = []
+        for username, name in DEMO_FANS:
+            if exists(username):
+                continue
+            fans.append(con.execute(
+                "INSERT INTO users(username, display_name, pw_hash, bio, created_at) VALUES(?,?,NULL,?,?)",
+                (username, name, "Sample foodie account used for demo likes.", now - 20 * 86400),
+            ).lastrowid)
+        for i, s in enumerate(TESTER_REVIEWS):
+            rid = _add_sample_review(con, tester, s, now - i * 5400 - 1800)
+            for k in range(min(TESTER_LIKES[i], len(fans))):
+                con.execute("INSERT OR IGNORE INTO likes(user_id, review_id) VALUES(?,?)", (fans[(i * 3 + k) % len(fans)], rid))
+        added = True
+    con.execute(f"PRAGMA user_version = {SEED_VERSION}")
+    con.commit()
+    return added
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def reset_password(username: str) -> int:
+    con = connect()
+    try:
+        row = con.execute("SELECT id, username FROM users WHERE username = ?", (username,)).fetchone()
+        if not row:
+            print(f"No such user: {username}", file=sys.stderr)
+            return 1
+        pw = getpass.getpass(f"New password for {row['username']} (min 8 chars): ")
+        if len(pw) < 8 or len(pw) > 128:
+            print("Password must be 8-128 characters.", file=sys.stderr)
+            return 1
+        if getpass.getpass("Repeat password: ") != pw:
+            print("Passwords do not match.", file=sys.stderr)
+            return 1
+        con.execute("UPDATE users SET pw_hash = ? WHERE id = ?", (hash_password(pw), row["id"]))
+        con.execute("DELETE FROM sessions WHERE user_id = ?", (row["id"],))
+        con.commit()
+        print(f"Password updated for {row['username']}.")
+        return 0
+    finally:
+        con.close()
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Rub rub - Thai street food reviews")
+    ap.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1; use 0.0.0.0 for LAN)")
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--data-dir", help="where to keep the database and photos (default ./data)")
+    ap.add_argument("--no-seed", action="store_true", help="don't create the sample Claude blogger + reviews")
+    ap.add_argument("--reset-password", metavar="USERNAME", help="set a new password for a user, then exit")
+    args = ap.parse_args(argv)
+
+    if args.data_dir:
+        configure(args.data_dir)
+    init_db()
+    if args.reset_password:
+        return reset_password(args.reset_password)
+
+    con = connect()
+    try:
+        if not args.no_seed and seed(con):
+            print("Added the sample profiles: 'claude' (featured blogger) and 'test_blogger' (famous reviewer).")
+    finally:
+        con.close()
+    cleanup_orphan_uploads()
+
+    server = make_server(args.host, args.port)
+    shown = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
+    print(f"Rub rub is sizzling at http://{shown}:{server.server_address[1]}  (Ctrl+C to stop)")
+    if args.host == "0.0.0.0":
+        print("Listening on all interfaces: anyone on your network can reach it. No HTTPS here.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nBye!")
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

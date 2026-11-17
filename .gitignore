@@ -1,0 +1,16 @@
+# Runtime data: the database holds user accounts and uploaded photos, never commit it
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+
+# Local tooling
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
