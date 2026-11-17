@@ -132,7 +132,7 @@
   /* food categories: ข้าวมันไก่ / ข้าวกระเพรา / ก๋วยเตี๋ยว / อื่นๆ */
   const CATS = ['khao_man_gai', 'kra_pao', 'noodles', 'other'];
   const CAT_ICON = { khao_man_gai: '🍗', kra_pao: '🍳', noodles: '🍜', other: '🍽️' };
-  const CAT_WORDS = [ // same order and words as CATEGORY_KEYWORDS in server.py
+  const CAT_WORDS = [ // same order and words as CATEGORY_KEYWORDS in rubrub.py
     ['khao_man_gai', ['khao man gai', 'kao man gai', 'man gai', 'hainan', 'ข้าวมันไก่']],
     ['kra_pao', ['kra pao', 'kaprao', 'krapow', 'ka prao', 'กะเพรา', 'กระเพรา']],
     ['noodles', ['noodle', 'kuay teow', 'guay teow', 'kway teow', 'ba mee', 'bamee', 'pad thai', 'khao soi', 'pad see ew',

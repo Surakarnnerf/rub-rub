@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Rub rub - Thai street food reviews.
 
-Zero-dependency server (Python 3.9+, standard library only).
+Python 3.9+. On your PC and in Docker it needs nothing but the standard library (SQLite file).
+On serverless hosts such as Vercel it runs as a WSGI app (`wsgi_app`, entry point api/index.py)
+on a Postgres database, which needs the `psycopg` package (requirements.txt).
 
-    python server.py                       # http://127.0.0.1:8000
-    python server.py --host 0.0.0.0        # share on your local network
-    python server.py --reset-password NAME # set/reset a user's password
+    python rubrub.py                       # http://127.0.0.1:8000
+    python rubrub.py --host 0.0.0.0        # share on your local network
+    python rubrub.py --reset-password NAME # set/reset a user's password
 
-Hosting (Render, Railway, Fly.io, a VPS...) is configured with environment variables, see
-README.md: PORT, RUBRUB_DATA_DIR, RUBRUB_TRUST_PROXY, RUBRUB_PROXY_HOPS, RUBRUB_SECURE_COOKIES,
-RUBRUB_SEED, RUBRUB_HOST, RUBRUB_RUN_AS_UID.  GET /healthz is the health-check endpoint.
+Hosting is configured with environment variables, see README.md: PORT, DATABASE_URL (Postgres),
+RUBRUB_DATA_DIR, RUBRUB_TRUST_PROXY, RUBRUB_PROXY_HOPS, RUBRUB_SECURE_COOKIES, RUBRUB_SEED,
+RUBRUB_HOST, RUBRUB_RUN_AS_UID.  GET /healthz is the health-check endpoint.
 """
 from __future__ import annotations
 
@@ -20,31 +22,41 @@ import hmac
 import json
 import os
 import re
+import random
 import secrets
 import signal
-import sqlite3
 import sys
 import threading
 import time
 import traceback
+from http import HTTPStatus
+from http.client import HTTPMessage
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+
+import db
 
 BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
+STATIC_DIR = BASE_DIR / "public"
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "rubrub.db"
-UPLOAD_DIR = DATA_DIR / "uploads"
+db.configure(sqlite_path=DB_PATH)  # the default: a SQLite file next to the app
 
 
 def configure(data_dir) -> None:
-    """Point the app at another data folder (used by the tests)."""
-    global DATA_DIR, DB_PATH, UPLOAD_DIR
+    """Use a SQLite database in another data folder (used by the tests)."""
+    global DATA_DIR, DB_PATH
     DATA_DIR = Path(data_dir).resolve()
     DB_PATH = DATA_DIR / "rubrub.db"
-    UPLOAD_DIR = DATA_DIR / "uploads"
+    db.configure(sqlite_path=DB_PATH)
+
+
+def use_postgres(url: str) -> None:
+    """Keep everything in a hosted Postgres database instead of a SQLite file."""
+    db.configure(sqlite_path=DB_PATH, postgres_url=url)
 
 
 # Reverse-proxy settings. Hosting platforms put a proxy in front of the app, and that is where
@@ -98,7 +110,7 @@ PAYMENTS = ("cash_only", "qr", "card")
 CATEGORIES = ("khao_man_gai", "kra_pao", "noodles", "other")  # ข้าวมันไก่, ข้าวกระเพรา, ก๋วยเตี๋ยว, อื่นๆ
 FAMOUS_LIKES = 25  # likes received (on all their reviews) before a reviewer earns the "famous" badge
 SEED_VERSION = 2
-CATEGORY_KEYWORDS = (  # checked in order; keep in sync with guessCategory() in static/js/app.js
+CATEGORY_KEYWORDS = (  # checked in order; keep in sync with guessCategory() in public/js/app.js
     ("khao_man_gai", ("khao man gai", "kao man gai", "man gai", "hainan", "ข้าวมันไก่")),
     ("kra_pao", ("kra pao", "kaprao", "krapow", "ka prao", "กะเพรา", "กระเพรา")),
     ("noodles", ("noodle", "kuay teow", "guay teow", "kway teow", "ba mee", "bamee", "pad thai", "khao soi", "pad see ew",
@@ -136,52 +148,9 @@ CONTENT_TYPES = {
     ".txt": "text/plain; charset=utf-8",
 }
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    username     TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    display_name TEXT NOT NULL,
-    pw_hash      TEXT,
-    bio          TEXT NOT NULL DEFAULT '',
-    is_featured  INTEGER NOT NULL DEFAULT 0,
-    created_at   INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS reviews (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    restaurant_name TEXT NOT NULL,
-    area            TEXT NOT NULL DEFAULT '',
-    menu_item       TEXT NOT NULL,
-    category        TEXT NOT NULL DEFAULT 'other',
-    rating          INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-    price_thb       INTEGER NOT NULL CHECK (price_thb BETWEEN 1 AND 10000),
-    cash_only       INTEGER NOT NULL DEFAULT 0,
-    pay_qr          INTEGER NOT NULL DEFAULT 0,
-    pay_card        INTEGER NOT NULL DEFAULT 0,
-    open_days       TEXT NOT NULL,
-    open_time       TEXT NOT NULL,
-    close_time      TEXT NOT NULL,
-    spice           INTEGER NOT NULL DEFAULT 0 CHECK (spice BETWEEN 0 AND 3),
-    body            TEXT NOT NULL DEFAULT '',
-    photo           TEXT,
-    is_sample       INTEGER NOT NULL DEFAULT 0,
-    created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS likes (
-    user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    review_id INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
-    PRIMARY KEY (user_id, review_id)
-);
-CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(user_id);
-CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);
-"""
+PHOTO_TYPES = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
 
+# The table definitions live in db.py (they differ a little between SQLite and Postgres).
 REVIEW_SELECT = """
 SELECT r.*, u.username, u.display_name, u.is_featured,
        (SELECT COUNT(*) FROM likes l2 JOIN reviews r2 ON r2.id = l2.review_id WHERE r2.user_id = u.id) AS author_likes,
@@ -209,11 +178,8 @@ class ApiError(Exception):
         self.fields = fields or {}
 
 
-def connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON")
-    return con
+def connect() -> db.Connection:
+    return db.connect()
 
 
 def guess_category(text: str) -> str:
@@ -225,18 +191,21 @@ def guess_category(text: str) -> str:
 
 
 def init_db() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    """Create the tables (and upgrade an older SQLite file). Safe to run on every start."""
+    if db.engine() == "sqlite":
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
     con = connect()
     try:
-        con.execute("PRAGMA journal_mode = WAL")
-        con.executescript(SCHEMA)
-        # upgrade databases created before categories existed
-        cols = {r["name"] for r in con.execute("PRAGMA table_info(reviews)")}
-        if "category" not in cols:
-            con.execute("ALTER TABLE reviews ADD COLUMN category TEXT NOT NULL DEFAULT 'other'")
-            for r in con.execute("SELECT id, menu_item FROM reviews").fetchall():
-                con.execute("UPDATE reviews SET category = ? WHERE id = ?", (guess_category(r["menu_item"]), r["id"]))
+        if con.engine == "sqlite":
+            con.execute("PRAGMA journal_mode = WAL")
+        con.executescript(db.schema_sql(con.engine))
+        if con.engine == "sqlite":
+            # upgrade a file created before categories existed
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(reviews)")}
+            if "category" not in cols:
+                con.execute("ALTER TABLE reviews ADD COLUMN category TEXT NOT NULL DEFAULT 'other'")
+                for r in con.execute("SELECT id, menu_item FROM reviews").fetchall():
+                    con.execute("UPDATE reviews SET category = ? WHERE id = ?", (guess_category(r["menu_item"]), r["id"]))
         con.commit()
     finally:
         con.close()
@@ -263,24 +232,36 @@ def verify_password(password: str, stored: str) -> bool:
 
 DUMMY_HASH = hash_password(secrets.token_hex(8))  # equalises timing for unknown users
 
-_rate_lock = threading.Lock()
-RATE: dict[str, list[float]] = {}
+def rate_ok(con, key: str, limit: int, window: int) -> bool:
+    """Record one attempt for `key`; False once `limit` attempts happened within `window` seconds.
+    The attempts live in the database, so every server instance (serverless ones too) shares them."""
+    now = int(time.time())
+    seen = con.execute("SELECT COUNT(*) FROM rate_hits WHERE rkey = ? AND ts > ?", (key, now - window)).fetchone()[0]
+    if seen >= limit:
+        return False
+    con.execute("INSERT INTO rate_hits(rkey, ts) VALUES(?, ?)", (key, now))
+    if random.random() < 0.02:  # now and then, forget attempts older than a day
+        con.execute("DELETE FROM rate_hits WHERE ts < ?", (now - 86400,))
+    con.commit()  # keep the attempt even when the request then fails: a wrong password is what we count
+    return True
 
 
-def rate_ok(key: str, limit: int, window: int) -> bool:
-    """Record one attempt for `key`; False once `limit` attempts happened within `window` s."""
-    now = time.time()
-    with _rate_lock:
-        if len(RATE) > 5000:
-            for k in [k for k, v in RATE.items() if not v or now - v[-1] > 3600]:
-                del RATE[k]
-        hits = [t for t in RATE.get(key, []) if now - t < window]
-        if len(hits) >= limit:
-            RATE[key] = hits
-            return False
-        hits.append(now)
-        RATE[key] = hits
-        return True
+def rate_keys() -> set:
+    """Which keys have recorded attempts (used by the tests)."""
+    con = connect()
+    try:
+        return {r[0] for r in con.execute("SELECT DISTINCT rkey FROM rate_hits")}
+    finally:
+        con.close()
+
+
+def reset_rate_limits() -> None:
+    con = connect()
+    try:
+        con.execute("DELETE FROM rate_hits")
+        con.commit()
+    finally:
+        con.close()
 
 
 def clean_line(value) -> str:
@@ -324,40 +305,25 @@ def payment_columns(payments) -> dict:
     }
 
 
-def delete_photo_if_unused(name: str | None) -> None:
-    if not name or not PHOTO_RE.match(name):
-        return
-    con = connect()
-    try:
-        if con.execute("SELECT 1 FROM reviews WHERE photo = ? LIMIT 1", (name,)).fetchone():
-            return
-    finally:
-        con.close()
-    try:
-        (UPLOAD_DIR / name).unlink()
-    except OSError:
-        pass
+def delete_photo_if_unused(con, name: str | None) -> None:
+    """Photos are rows in the database. Drop one once no review uses it any more."""
+    if name and PHOTO_RE.match(name):
+        con.execute("DELETE FROM photos WHERE name = ? AND NOT EXISTS (SELECT 1 FROM reviews WHERE photo = ?)", (name, name))
 
 
-def cleanup_orphan_uploads() -> None:
-    con = connect()
-    try:
-        used = {r[0] for r in con.execute("SELECT photo FROM reviews WHERE photo IS NOT NULL")}
-    finally:
-        con.close()
-    cutoff = time.time() - 24 * 3600
-    for f in UPLOAD_DIR.iterdir():
-        try:
-            if f.is_file() and f.name not in used and f.stat().st_mtime < cutoff:
-                f.unlink()
-        except OSError:
-            pass
+def cleanup_orphan_photos(con) -> None:
+    """Uploaded but never attached to a review (the poster gave up): forget them after a day."""
+    con.execute(
+        "DELETE FROM photos WHERE created_at < ? AND name NOT IN (SELECT photo FROM reviews WHERE photo IS NOT NULL)",
+        (int(time.time()) - 24 * 3600,),
+    )
+    con.commit()
 
 
 # --------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------
-def validate_review(d: dict) -> dict:
+def validate_review(d: dict, con) -> dict:
     errors: dict[str, str] = {}
     out: dict = {}
 
@@ -441,7 +407,8 @@ def validate_review(d: dict) -> dict:
     photo = d.get("photo")
     if photo in (None, ""):
         out["photo"] = None
-    elif isinstance(photo, str) and PHOTO_RE.match(photo) and (UPLOAD_DIR / photo).is_file():
+    elif (isinstance(photo, str) and PHOTO_RE.match(photo)
+          and con.execute("SELECT 1 FROM photos WHERE name = ?", (photo,)).fetchone()):
         out["photo"] = photo
     else:
         errors["photo"] = "invalid"
@@ -502,7 +469,7 @@ def user_json(u, review_count: int, avg, likes_received: int) -> dict:
         "famous_at": FAMOUS_LIKES,
         "created_at": u["created_at"],
         "review_count": review_count,
-        "avg_rating": round(avg, 1) if avg is not None else None,
+        "avg_rating": round(float(avg), 1) if avg is not None else None,  # Postgres AVG() is a Decimal
         "likes_received": likes_received,
     }
 
@@ -556,7 +523,7 @@ def api_me(h, q):
 
 @route("POST", "/api/signup")
 def api_signup(h, q):
-    if not rate_ok(f"signup:{h.client_ip()}", 20, 3600):
+    if not rate_ok(h.con, f"signup:{h.client_ip()}", 20, 3600):
         raise ApiError(429, "rate_limited")
     d = h.read_json()
     errors = {}
@@ -573,17 +540,17 @@ def api_signup(h, q):
         errors["password"] = "too_long"
     if errors:
         raise ApiError(400, "validation", errors)
-    if h.con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+    if h.con.execute("SELECT 1 FROM users WHERE lower(username) = lower(?)", (username,)).fetchone():
         raise ApiError(409, "validation", {"username": "username_taken"})
     try:
-        cur = h.con.execute(
-            "INSERT INTO users(username, display_name, pw_hash, created_at) VALUES(?,?,?,?)",
+        uid = h.con.execute(
+            "INSERT INTO users(username, display_name, pw_hash, created_at) VALUES(?,?,?,?) RETURNING id",
             (username, display, hash_password(password), int(time.time())),
-        )
-    except sqlite3.IntegrityError:
+        ).fetchone()[0]
+    except db.integrity_errors:
         raise ApiError(409, "validation", {"username": "username_taken"})
-    start_session(h, cur.lastrowid)
-    user = h.con.execute("SELECT * FROM users WHERE id = ?", (cur.lastrowid,)).fetchone()
+    start_session(h, uid)
+    user = h.con.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
     return 201, {"user": me_json(user)}
 
 
@@ -593,15 +560,14 @@ def api_login(h, q):
     username = str(d.get("username") or "").strip()
     password = d.get("password")
     key = f"login:{h.client_ip()}:{username.lower()}"
-    if not rate_ok(key, 8, 600):
+    if not rate_ok(h.con, key, 8, 600):
         raise ApiError(429, "rate_limited")
-    row = h.con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    row = h.con.execute("SELECT * FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
     stored = row["pw_hash"] if row and row["pw_hash"] else DUMMY_HASH
     good = isinstance(password, str) and verify_password(password, stored)
     if not (good and row and row["pw_hash"]):
         raise ApiError(401, "bad_credentials")
-    with _rate_lock:
-        RATE.pop(key, None)
+    h.con.execute("DELETE FROM rate_hits WHERE rkey = ?", (key,))  # a correct login clears the failed attempts
     start_session(h, row["id"])
     return {"user": me_json(row)}
 
@@ -625,8 +591,8 @@ def api_reviews(h, q):
     if text:
         like = "%" + like_escape(text) + "%"
         where.append(
-            "(r.restaurant_name LIKE ? ESCAPE '\\' OR r.menu_item LIKE ? ESCAPE '\\' "
-            "OR r.area LIKE ? ESCAPE '\\' OR r.body LIKE ? ESCAPE '\\')"
+            "(lower(r.restaurant_name) LIKE lower(?) ESCAPE '\\' OR lower(r.menu_item) LIKE lower(?) ESCAPE '\\' "
+            "OR lower(r.area) LIKE lower(?) ESCAPE '\\' OR lower(r.body) LIKE lower(?) ESCAPE '\\')"
         )
         args += [like] * 4
     pay = qstr(q, "payment")
@@ -646,7 +612,7 @@ def api_reviews(h, q):
         args.append(min_rating)
     user = qstr(q, "user").strip()
     if user:
-        where.append("u.username = ?")
+        where.append("lower(u.username) = lower(?)")
         args.append(user)
     if qstr(q, "featured") == "1":
         where.append("u.is_featured = 1")
@@ -687,16 +653,16 @@ REVIEW_COLUMNS = (
 @route("POST", "/api/reviews")
 def api_review_create(h, q):
     me = h.require_user()
-    if not rate_ok(f"review:{me['id']}", 30, 3600):
+    if not rate_ok(h.con, f"review:{me['id']}", 30, 3600):
         raise ApiError(429, "rate_limited")
-    data = validate_review(h.read_json())
+    data = validate_review(h.read_json(), h.con)
     now = int(time.time())
     cols = ("user_id", *REVIEW_COLUMNS, "created_at", "updated_at")
-    cur = h.con.execute(
-        f"INSERT INTO reviews({', '.join(cols)}) VALUES({', '.join('?' * len(cols))})",
+    rid = h.con.execute(
+        f"INSERT INTO reviews({', '.join(cols)}) VALUES({', '.join('?' * len(cols))}) RETURNING id",
         [me["id"], *(data[c] for c in REVIEW_COLUMNS), now, now],
-    )
-    return 201, {"review": review_json(fetch_review(h, cur.lastrowid))}
+    ).fetchone()[0]
+    return 201, {"review": review_json(fetch_review(h, rid))}
 
 
 def owned_review(h, rid: int):
@@ -712,14 +678,14 @@ def owned_review(h, rid: int):
 @route("PUT", r"/api/reviews/(\d+)")
 def api_review_update(h, q, rid):
     row = owned_review(h, int(rid))
-    data = validate_review(h.read_json())
+    data = validate_review(h.read_json(), h.con)
     sets = ", ".join(f"{c} = ?" for c in REVIEW_COLUMNS)
     h.con.execute(
         f"UPDATE reviews SET {sets}, updated_at = ? WHERE id = ?",
         [*(data[c] for c in REVIEW_COLUMNS), int(time.time()), row["id"]],
     )
     if row["photo"] and row["photo"] != data["photo"]:
-        h.after_commit.append(lambda name=row["photo"]: delete_photo_if_unused(name))
+        delete_photo_if_unused(h.con, row["photo"])
     return {"review": review_json(fetch_review(h, row["id"]))}
 
 
@@ -727,7 +693,7 @@ def api_review_update(h, q, rid):
 def api_review_delete(h, q, rid):
     row = owned_review(h, int(rid))
     h.con.execute("DELETE FROM reviews WHERE id = ?", (row["id"],))
-    h.after_commit.append(lambda name=row["photo"]: delete_photo_if_unused(name))
+    delete_photo_if_unused(h.con, row["photo"])
     return {"ok": True}
 
 
@@ -742,14 +708,15 @@ def api_like(h, q, rid):
     cur = h.con.execute("DELETE FROM likes WHERE user_id = ? AND review_id = ?", (me["id"], int(rid)))
     liked = cur.rowcount == 0
     if liked:
-        h.con.execute("INSERT OR IGNORE INTO likes(user_id, review_id) VALUES(?,?)", (me["id"], int(rid)))
+        h.con.execute(
+            "INSERT INTO likes(user_id, review_id) VALUES(?,?) ON CONFLICT DO NOTHING", (me["id"], int(rid)))
     count = h.con.execute("SELECT COUNT(*) FROM likes WHERE review_id = ?", (int(rid),)).fetchone()[0]
     return {"liked": liked, "likes": count}
 
 
 @route("GET", r"/api/users/([A-Za-z0-9_]{3,20})")
 def api_user(h, q, username):
-    u = h.con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    u = h.con.execute("SELECT * FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
     if not u:
         raise ApiError(404, "not_found")
     stats = h.con.execute("SELECT COUNT(*) AS n, AVG(rating) AS avg FROM reviews WHERE user_id = ?", (u["id"],)).fetchone()
@@ -763,12 +730,14 @@ def api_user(h, q, username):
 def api_famous_users(h, q):
     """Reviewers who earned the 'famous' badge from other people's likes (the featured blogger has her own spotlight)."""
     rows = h.con.execute(
-        """SELECT u.*, COUNT(r.id) AS n, AVG(r.rating) AS avg,
-                  (SELECT COUNT(*) FROM likes l JOIN reviews r2 ON r2.id = l.review_id WHERE r2.user_id = u.id) AS got
-           FROM users u JOIN reviews r ON r.user_id = u.id
-           WHERE u.is_featured = 0
-           GROUP BY u.id
-           HAVING got >= ?
+        """SELECT * FROM (
+               SELECT u.*, COUNT(r.id) AS n, AVG(r.rating) AS avg,
+                      (SELECT COUNT(*) FROM likes l JOIN reviews r2 ON r2.id = l.review_id WHERE r2.user_id = u.id) AS got
+               FROM users u JOIN reviews r ON r.user_id = u.id
+               WHERE u.is_featured = 0
+               GROUP BY u.id
+           ) t
+           WHERE got >= ?
            ORDER BY got DESC, n DESC
            LIMIT ?""",
         (FAMOUS_LIKES, qint(q, "limit", 6, 1, 20)),
@@ -804,14 +773,17 @@ def api_restaurants(h, q):
 @route("POST", "/api/upload")
 def api_upload(h, q):
     me = h.require_user()
-    if not rate_ok(f"upload:{me['id']}", 60, 3600):
+    if not rate_ok(h.con, f"upload:{me['id']}", 60, 3600):
         raise ApiError(429, "rate_limited")
     data = h.read_body(MAX_UPLOAD)
     ext = sniff_image(data)
     if not ext:
         raise ApiError(415, "bad_image")
     name = f"{secrets.token_hex(12)}.{ext}"
-    (UPLOAD_DIR / name).write_bytes(data)
+    h.con.execute(
+        "INSERT INTO photos(name, content_type, data, created_at) VALUES(?,?,?,?)",
+        (name, PHOTO_TYPES[ext], data, int(time.time())),
+    )
     return 201, {"photo": name, "url": f"/uploads/{name}"}
 
 
@@ -833,9 +805,19 @@ class Handler(BaseHTTPRequestHandler):
     do_DELETE = do_GET
 
     def handle_request(self):
+        """Built-in server: work out the answer, then write it to the socket."""
+        self.process()
+        try:
+            self.flush_response()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass  # the visitor went away
+
+    def process(self):
+        """Work out the response and keep it in self.response. Nothing here touches a socket, so the
+        same code serves the built-in server and WSGI hosts (Vercel)."""
         self.con = None
         self.cookies: list[str] = []
-        self.after_commit: list = []
+        self.response = None
         self._user = False
         self._body_read = False
         try:
@@ -850,27 +832,33 @@ class Handler(BaseHTTPRequestHandler):
                     self.con.commit()
                 finally:
                     self.con.close()
-                for fn in self.after_commit:
-                    try:
-                        fn()
-                    except Exception:  # best-effort file cleanup
-                        traceback.print_exc()
                 status, payload = result if isinstance(result, tuple) else (200, result)
                 self.send_json(payload, status)
+            elif path.startswith("/uploads/"):
+                self.serve_photo(path[len("/uploads/"):])
             else:
                 self.serve_static(path)
         except ApiError as e:
             self.send_json({"error": e.code, "fields": e.fields}, e.status)
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            pass
+        except db.DatabaseNotConfigured as e:
+            print(f"ERROR: {e}", flush=True)
+            self.send_json({"error": "database_not_configured"}, 503)
         except Exception:
             traceback.print_exc()
-            try:
-                self.send_json({"error": "server_error"}, 500)
-            except Exception:
-                pass
+            self.send_json({"error": "server_error"}, 500)
         finally:
             self.drain_body()
+
+    def flush_response(self):
+        if self.response is None:
+            return
+        status, headers, body = self.response
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
 
     def dispatch_api(self, path: str, query: dict):
         self.check_csrf()
@@ -1001,20 +989,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- responses -----------------------------------------------------------
     def send_bytes(self, status: int, body: bytes, ctype: str, extra: dict | None = None):
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        for k, v in SECURITY_HEADERS.items():
-            self.send_header(k, v)
+        headers = [("Content-Type", ctype), ("Content-Length", str(len(body)))]
+        headers += list(SECURITY_HEADERS.items())
         if self.is_https():
-            self.send_header("Strict-Transport-Security", "max-age=31536000")
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        for c in self.cookies:
-            self.send_header("Set-Cookie", c)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+            headers.append(("Strict-Transport-Security", "max-age=31536000"))
+        headers += list((extra or {}).items())
+        headers += [("Set-Cookie", c) for c in self.cookies]
+        self.response = (status, headers, b"" if self.command == "HEAD" else body)
 
     def send_json(self, payload, status: int = 200):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1025,23 +1006,31 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(405, "method_not_allowed")
         if "\\" in path or ":" in path or "\x00" in path:
             raise ApiError(404, "not_found")
-        if path.startswith("/uploads/"):
-            name = path[len("/uploads/"):]
-            if not PHOTO_RE.match(name):
-                raise ApiError(404, "not_found")
-            file = UPLOAD_DIR / name
-            cache = "public, max-age=31536000, immutable"
-        else:
-            file = (STATIC_DIR / (path.lstrip("/") or "index.html")).resolve()
-            if not file.is_relative_to(STATIC_DIR):
-                raise ApiError(404, "not_found")
-            if file.is_dir():
-                file = file / "index.html"
-            cache = "no-cache"
+        file = (STATIC_DIR / (path.lstrip("/") or "index.html")).resolve()
+        if not file.is_relative_to(STATIC_DIR):
+            raise ApiError(404, "not_found")
+        if file.is_dir():
+            file = file / "index.html"
         if not file.is_file():
             raise ApiError(404, "not_found")
         ctype = CONTENT_TYPES.get(file.suffix.lower(), "application/octet-stream")
-        self.send_bytes(200, file.read_bytes(), ctype, {"Cache-Control": cache})
+        self.send_bytes(200, file.read_bytes(), ctype, {"Cache-Control": "no-cache"})
+
+    def serve_photo(self, name: str):
+        """Review photos are rows in the database (serverless hosts have no disk to keep files on)."""
+        if self.command not in ("GET", "HEAD"):
+            raise ApiError(405, "method_not_allowed")
+        if not PHOTO_RE.match(name):
+            raise ApiError(404, "not_found")
+        con = connect()
+        try:
+            row = con.execute("SELECT content_type, data FROM photos WHERE name = ?", (name,)).fetchone()
+        finally:
+            con.close()
+        if not row:
+            raise ApiError(404, "not_found")
+        # the name is random and never reused, so the browser and the host's CDN may keep it forever
+        self.send_bytes(200, bytes(row["data"]), row["content_type"], {"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 class RubServer(ThreadingHTTPServer):
@@ -1053,6 +1042,111 @@ class RubServer(ThreadingHTTPServer):
 
 def make_server(host: str, port: int) -> RubServer:
     return RubServer((host, port), Handler)
+
+
+# --------------------------------------------------------------------------
+# WSGI entry point: Vercel and other serverless hosts call this once per request
+# --------------------------------------------------------------------------
+API_PREFIXES = ("/api/", "/uploads/", "/healthz")
+
+
+def request_target(environ) -> tuple[str, str]:
+    """(path, query string) of the original request.
+
+    vercel.json rewrites /api/*, /uploads/* and /healthz to the one function and passes the real path
+    along as ?rr_path=..., so routing works whether or not the platform keeps the original path."""
+    path = environ.get("PATH_INFO") or "/"
+    query = environ.get("QUERY_STRING") or ""
+    params = parse_qs(query, keep_blank_values=True)
+    real = (params.pop("rr_path", [""])[0] or "")
+    if real.startswith(API_PREFIXES):
+        path, query = real, urlencode(params, doseq=True)
+    return quote(path, safe="/"), query  # Handler.process() unquotes it again, as it does for a socket request
+
+
+class WsgiRequest(Handler):
+    """The request logic of Handler, fed from a WSGI environ instead of a socket."""
+
+    def __init__(self, environ):  # on purpose not BaseHTTPRequestHandler.__init__: there is no socket
+        self.command = (environ.get("REQUEST_METHOD") or "GET").upper()
+        headers = HTTPMessage()
+        for key, value in environ.items():
+            if key.startswith("HTTP_"):
+                headers[key[5:].replace("_", "-").title()] = str(value)
+        for key, name in (("CONTENT_TYPE", "Content-Type"), ("CONTENT_LENGTH", "Content-Length")):
+            if environ.get(key):
+                headers[name] = str(environ[key])
+        self.headers = headers
+        path, query = request_target(environ)
+        self.path = path + ("?" + query if query else "")
+        self.client_address = (environ.get("REMOTE_ADDR") or "0.0.0.0", 0)
+        self.rfile = environ.get("wsgi.input") or BytesIO()
+        self.cookies = []
+        self.response = None
+
+
+_ready = False
+_ready_lock = threading.Lock()
+
+
+def apply_environment(environ=None) -> None:
+    """Settings that hosting platforms provide as environment variables."""
+    env = os.environ if environ is None else environ
+    on_vercel = bool(env.get("VERCEL"))
+    if env.get("RUBRUB_DATA_DIR"):
+        configure(env["RUBRUB_DATA_DIR"])
+    url = db.postgres_url_from_env(env)
+    if url:
+        use_postgres(url)
+    elif on_vercel:
+        # Vercel has no disk to keep a SQLite file on: without a Postgres database nothing can be saved
+        raise db.DatabaseNotConfigured(
+            "No Postgres database is connected. In the Vercel dashboard open Storage, create a Neon "
+            "Postgres database, connect it to this project and redeploy.")
+    if on_vercel or "RUBRUB_TRUST_PROXY" in env:  # Vercel always sits in front of the app and sets X-Forwarded-*
+        configure_proxy(env_flag("RUBRUB_TRUST_PROXY", on_vercel, env), int(env.get("RUBRUB_PROXY_HOPS") or 1),
+                        env_flag("RUBRUB_SECURE_COOKIES", False, env))
+
+
+def ensure_ready(force: bool = False) -> None:
+    """Once per server process (a "cold start" on serverless hosts): choose the database, create the
+    tables, add the sample profiles. Concurrent cold starts are safe: seeding skips what already exists."""
+    global _ready
+    if _ready and not force:
+        return
+    with _ready_lock:
+        if _ready and not force:
+            return
+        apply_environment()
+        init_db()
+        con = connect()
+        try:
+            if env_flag("RUBRUB_SEED", True):
+                seed(con)
+            cleanup_orphan_photos(con)
+        finally:
+            con.close()
+        _ready = True
+
+
+def wsgi_app(environ, start_response):
+    req = WsgiRequest(environ)
+    if req.path.startswith(API_PREFIXES):
+        try:
+            ensure_ready()
+        except db.DatabaseNotConfigured as e:
+            print(f"ERROR: {e}", flush=True)
+            req.send_json({"error": "database_not_configured"}, 503)
+        except Exception:
+            traceback.print_exc()
+            req.send_json({"error": "server_error"}, 503)
+        else:
+            req.process()
+    else:
+        req.process()  # static files (on Vercel the CDN serves these before the function is reached)
+    status, headers, body = req.response or (500, [("Content-Type", "text/plain")], b"server error")
+    start_response(f"{status} {HTTPStatus(status).phrase}", headers)
+    return [body]
 
 
 # --------------------------------------------------------------------------
@@ -1178,7 +1272,7 @@ DEMO_FANS = [("demo_nok", "Nok"), ("demo_pim", "Pim"), ("demo_ton", "Ton"), ("de
 TESTER_LIKES = [12, 10, 9, 8, 7, 6]  # per review, 52 in total, comfortably over FAMOUS_LIKES
 
 
-def _add_sample_review(con: sqlite3.Connection, user_id: int, s: dict, created: int) -> int:
+def _add_sample_review(con, user_id: int, s: dict, created: int) -> int:
     row = {k: v for k, v in s.items() if k not in ("payments", "open_days")}
     row.setdefault("category", guess_category(s["menu_item"]))
     row.update(payment_columns(s["payments"]))
@@ -1186,48 +1280,70 @@ def _add_sample_review(con: sqlite3.Connection, user_id: int, s: dict, created: 
     row.update(user_id=user_id, photo=None, is_sample=1, created_at=created, updated_at=created)
     cols = list(row)
     return con.execute(
-        f"INSERT INTO reviews({', '.join(cols)}) VALUES({', '.join('?' * len(cols))})", [row[c] for c in cols]
-    ).lastrowid
+        f"INSERT INTO reviews({', '.join(cols)}) VALUES({', '.join('?' * len(cols))}) RETURNING id", [row[c] for c in cols]
+    ).fetchone()[0]
 
 
-def seed(con: sqlite3.Connection) -> bool:
+def seed_version(con) -> int:
+    value = db.get_meta(con, "seed_version")
+    if value is not None:
+        return int(value)
+    if con.engine == "sqlite":  # a file from before the meta table existed kept the number in its header
+        return con.execute("PRAGMA user_version").fetchone()[0]
+    return 0
+
+
+def seed(con) -> bool:
     """Add the demo profiles. Each demo user is created only if missing, and only until the
     seed version is recorded, so deleting a demo review never brings it back."""
-    if con.execute("PRAGMA user_version").fetchone()[0] >= SEED_VERSION:
+    if seed_version(con) >= SEED_VERSION:
         return False
 
     def exists(name: str) -> bool:
-        return con.execute("SELECT 1 FROM users WHERE username = ?", (name,)).fetchone() is not None
+        return con.execute("SELECT 1 FROM users WHERE lower(username) = lower(?)", (name,)).fetchone() is not None
 
     now = int(time.time())
     added = False
-    if not exists("claude"):
-        uid = con.execute(
-            "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,1,?)",
-            ("claude", "Claude", CLAUDE_BIO, now),
-        ).lastrowid
-        for i, s in enumerate(SAMPLE_REVIEWS):
-            _add_sample_review(con, uid, s, now - i * 7200)
-        added = True
-    if not exists("test_blogger"):
-        tester = con.execute(
-            "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,0,?)",
-            ("test_blogger", "Test Eater", TESTER_BIO, now - 30 * 86400),
-        ).lastrowid
-        fans = []
-        for username, name in DEMO_FANS:
-            if exists(username):
-                continue
-            fans.append(con.execute(
-                "INSERT INTO users(username, display_name, pw_hash, bio, created_at) VALUES(?,?,NULL,?,?)",
-                (username, name, "Sample foodie account used for demo likes.", now - 20 * 86400),
-            ).lastrowid)
-        for i, s in enumerate(TESTER_REVIEWS):
-            rid = _add_sample_review(con, tester, s, now - i * 5400 - 1800)
-            for k in range(min(TESTER_LIKES[i], len(fans))):
-                con.execute("INSERT OR IGNORE INTO likes(user_id, review_id) VALUES(?,?)", (fans[(i * 3 + k) % len(fans)], rid))
-        added = True
-    con.execute(f"PRAGMA user_version = {SEED_VERSION}")
+    try:
+        if not exists("claude"):
+            uid = con.execute(
+                "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,1,?) RETURNING id",
+                ("claude", "Claude", CLAUDE_BIO, now),
+            ).fetchone()[0]
+            for i, s in enumerate(SAMPLE_REVIEWS):
+                _add_sample_review(con, uid, s, now - i * 7200)
+            con.commit()
+            added = True
+        if not exists("test_blogger"):
+            tester = con.execute(
+                "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,0,?) RETURNING id",
+                ("test_blogger", "Test Eater", TESTER_BIO, now - 30 * 86400),
+            ).fetchone()[0]
+            names = [u for u, _ in DEMO_FANS]
+            marks = ",".join("?" * len(names))
+            taken = {r[0] for r in con.execute(f"SELECT lower(username) FROM users WHERE lower(username) IN ({marks})", names)}
+            new_fans = [(u, n) for u, n in DEMO_FANS if u not in taken]
+            if new_fans:
+                con.execute(
+                    "INSERT INTO users(username, display_name, pw_hash, bio, created_at) VALUES "
+                    + ",".join(["(?,?,NULL,?,?)"] * len(new_fans)),
+                    [x for u, n in new_fans for x in (u, n, "Sample foodie account used for demo likes.", now - 20 * 86400)],
+                )
+            fans = [r[0] for r in con.execute(f"SELECT id FROM users WHERE lower(username) IN ({marks}) ORDER BY id", names)]
+            likes = []
+            for i, s in enumerate(TESTER_REVIEWS):
+                rid = _add_sample_review(con, tester, s, now - i * 5400 - 1800)
+                likes += [(fans[(i * 3 + k) % len(fans)], rid) for k in range(min(TESTER_LIKES[i], len(fans)))]
+            if likes:  # one statement for all the likes: fewer round trips to a database across the internet
+                con.execute(
+                    "INSERT INTO likes(user_id, review_id) VALUES " + ",".join(["(?,?)"] * len(likes)) + " ON CONFLICT DO NOTHING",
+                    [x for pair in likes for x in pair],
+                )
+            con.commit()
+            added = True
+    except db.integrity_errors:
+        con.rollback()  # another server process is seeding at this very moment, which is fine
+    db.set_meta(con, "seed_version", SEED_VERSION)
     con.commit()
     return added
 
@@ -1238,7 +1354,7 @@ def seed(con: sqlite3.Connection) -> bool:
 def reset_password(username: str) -> int:
     con = connect()
     try:
-        row = con.execute("SELECT id, username FROM users WHERE username = ?", (username,)).fetchone()
+        row = con.execute("SELECT id, username FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
         if not row:
             print(f"No such user: {username}", file=sys.stderr)
             return 1
@@ -1268,7 +1384,9 @@ def parse_args(argv=None, environ=None):
                     help="interface to bind (default 127.0.0.1, or 0.0.0.0 when PORT is set) [RUBRUB_HOST]")
     ap.add_argument("--port", type=int, default=env.get("PORT") or "8000", help="port to listen on [PORT]")
     ap.add_argument("--data-dir", default=env.get("RUBRUB_DATA_DIR") or None,
-                    help="where to keep the database and photos (default ./data) [RUBRUB_DATA_DIR]")
+                    help="where to keep the SQLite database file (default ./data) [RUBRUB_DATA_DIR]")
+    ap.add_argument("--database-url", default=db.postgres_url_from_env(env),
+                    help="use a Postgres database instead of the SQLite file [DATABASE_URL]")
     ap.add_argument("--no-seed", action="store_true", default=not env_flag("RUBRUB_SEED", True, env),
                     help="don't create the sample Claude blogger + reviews [RUBRUB_SEED=0]")
     ap.add_argument("--trust-proxy", action="store_true", default=env_flag("RUBRUB_TRUST_PROXY", False, env),
@@ -1294,6 +1412,8 @@ def main(argv=None) -> int:
 
     if args.data_dir:
         configure(args.data_dir)
+    if args.database_url:
+        use_postgres(args.database_url)
     configure_proxy(args.trust_proxy, args.proxy_hops, args.secure_cookies)
     if args.run_as_uid is not None:
         drop_privileges(args.run_as_uid)  # before touching the database, so its files get the right owner
@@ -1305,9 +1425,9 @@ def main(argv=None) -> int:
     try:
         if not args.no_seed and seed(con):
             print("Added the sample profiles: 'claude' (featured blogger) and 'test_blogger' (famous reviewer).")
+        cleanup_orphan_photos(con)
     finally:
         con.close()
-    cleanup_orphan_uploads()
 
     server = make_server(args.host, args.port)
 
@@ -1323,7 +1443,7 @@ def main(argv=None) -> int:
 
     shown = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
     print(f"Rub rub is sizzling at http://{shown}:{server.server_address[1]}  (Ctrl+C to stop)", flush=True)
-    print(f"Data folder: {DATA_DIR}", flush=True)
+    print("Database: Postgres" if db.engine() == "postgres" else f"Data folder: {DATA_DIR}", flush=True)
     if args.trust_proxy:
         print(f"Trusting {args.proxy_hops} reverse proxy hop(s) for visitor IP and HTTPS.", flush=True)
     elif args.on_platform:

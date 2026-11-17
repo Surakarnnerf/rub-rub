@@ -11,9 +11,11 @@ import threading
 import unittest
 from http.cookies import SimpleCookie
 from pathlib import Path
+from wsgiref.simple_server import WSGIRequestHandler, make_server as make_wsgi_server
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import server  # noqa: E402
+import db  # noqa: E402
+import rubrub as server  # noqa: E402  (the module used to be called server.py)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
@@ -72,26 +74,41 @@ class Client:
 
 
 class AppTest(unittest.TestCase):
+    """The whole API against the built-in server and SQLite. WsgiAppTest and PostgresAppTest below
+    run these very same tests behind the WSGI entry point and on Postgres by overriding the hooks."""
+
     @classmethod
-    def setUpClass(cls):
+    def prepare_database(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         server.configure(cls.tmp.name)
         server.init_db()
         con = server.connect()
         server.seed(con)
         con.close()
+
+    @classmethod
+    def cleanup_database(cls):
+        cls.tmp.cleanup()
+
+    @classmethod
+    def start_server(cls):
         cls.httpd = server.make_server("127.0.0.1", 0)
         cls.port = cls.httpd.server_address[1]
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
 
     @classmethod
+    def setUpClass(cls):
+        cls.prepare_database()
+        cls.start_server()
+
+    @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
-        cls.tmp.cleanup()
+        cls.cleanup_database()
 
     def setUp(self):
-        server.RATE.clear()
+        server.reset_rate_limits()
 
     def client(self):
         return Client(self.port)
@@ -294,7 +311,9 @@ class AppTest(unittest.TestCase):
         try:
             uid = con.execute("SELECT id FROM users WHERE username = 'nina_star'").fetchone()[0]
             for i in range(server.FAMOUS_LIKES):
-                fan = con.execute("INSERT INTO users(username, display_name, created_at) VALUES(?,?,0)", (f"fan_{i:03d}", "fan")).lastrowid
+                fan = con.execute(
+                    "INSERT INTO users(username, display_name, created_at) VALUES(?,?,0) RETURNING id", (f"fan_{i:03d}", "fan")
+                ).fetchone()[0]
                 con.execute("INSERT INTO likes(user_id, review_id) VALUES(?,?)", (fan, rid))
             con.commit()
         finally:
@@ -324,12 +343,35 @@ class AppTest(unittest.TestCase):
         name = body["photo"]
         status, data, headers = self.client().request("GET", body["url"])
         self.assertEqual(status, 200)
+        self.assertEqual(data, PNG)  # the photo is stored in the database and comes back byte for byte
         self.assertEqual(headers["Content-Type"], "image/png")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("immutable", headers["Cache-Control"])
         r = c.request("POST", "/api/reviews", dict(GOOD_REVIEW, photo=name))[1]["review"]
         self.assertEqual(r["photo"], f"/uploads/{name}")
         c.request("DELETE", f"/api/reviews/{r['id']}")
         self.assertEqual(self.client().request("GET", f"/uploads/{name}")[0], 404)  # cleaned up
+
+    def test_replacing_a_photo_removes_the_old_one_and_orphans_expire(self):
+        c = self.signup("kay_pics")
+        up = lambda: c.request("POST", "/api/upload", raw=PNG, headers={"Content-Type": "image/png"})[1]["photo"]
+        first, second, forgotten = up(), up(), up()
+        rid = c.request("POST", "/api/reviews", dict(GOOD_REVIEW, photo=first))[1]["review"]["id"]
+        c.request("PUT", f"/api/reviews/{rid}", dict(GOOD_REVIEW, photo=second))
+        anon = self.client()
+        self.assertEqual(anon.request("GET", f"/uploads/{first}")[0], 404)  # no longer used by any review
+        self.assertEqual(anon.request("GET", f"/uploads/{second}")[0], 200)
+        con = server.connect()
+        try:
+            server.cleanup_orphan_photos(con)  # too fresh: the poster may still be filling in the form
+            self.assertEqual(anon.request("GET", f"/uploads/{forgotten}")[0], 200)
+            con.execute("UPDATE photos SET created_at = 0 WHERE name = ?", (forgotten,))
+            con.commit()
+            server.cleanup_orphan_photos(con)
+        finally:
+            con.close()
+        self.assertEqual(anon.request("GET", f"/uploads/{forgotten}")[0], 404)
+        self.assertEqual(anon.request("GET", f"/uploads/{second}")[0], 200)  # in use: kept
 
     def test_upload_rejects_non_images_and_big_files(self):
         c = self.signup("jon_bad")
@@ -347,8 +389,8 @@ class AppTest(unittest.TestCase):
         self.assertIn(b"Rub rub", body)
         self.assertIn("script-src 'self'", h["Content-Security-Policy"])
         self.assertEqual(c.request("GET", "/js/app.js")[2]["Content-Type"], "text/javascript; charset=utf-8")
-        for evil in ("/../server.py", "/%2e%2e/server.py", "/..%5cserver.py", "/css/../../server.py", "/uploads/../rubrub.db",
-                     "/index.html::$DATA"):
+        for evil in ("/../rubrub.py", "/%2e%2e/rubrub.py", "/..%5crubrub.py", "/css/../../rubrub.py", "/uploads/../rubrub.db",
+                     "/index.html::$DATA", "/../db.py"):
             s, _, _ = c.request("GET", evil)
             self.assertEqual(s, 404, evil)
         self.assertEqual(c.request("GET", "/api/nope")[0], 404)
@@ -416,7 +458,7 @@ class HostingTest(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
-        server.RATE.clear()
+        server.reset_rate_limits()
         server.configure_proxy()
 
     def tearDown(self):
@@ -448,19 +490,19 @@ class HostingTest(unittest.TestCase):
     def test_trusted_proxy_gives_each_visitor_their_own_limit(self):
         server.configure_proxy(trust=True)
         self.assertNotIn(429, self.login_attempts(10, lambda i: f"10.0.0.{i}"))
-        server.RATE.clear()
+        server.reset_rate_limits()
         self.assertEqual(self.login_attempts(10, lambda i: "203.0.113.9")[8], 429)  # the same visitor is still limited
 
     def test_proxy_hops_pick_the_address_the_proxy_added(self):
         chain = lambda i: "6.6.6.6, 203.0.113.5"  # the left entry is whatever the visitor claimed
         server.configure_proxy(trust=True, hops=1)
         self.login_attempts(1, chain)
-        self.assertIn("login:203.0.113.5:ghost", server.RATE)
-        self.assertNotIn("login:6.6.6.6:ghost", server.RATE)
-        server.RATE.clear()
+        self.assertIn("login:203.0.113.5:ghost", server.rate_keys())
+        self.assertNotIn("login:6.6.6.6:ghost", server.rate_keys())
+        server.reset_rate_limits()
         server.configure_proxy(trust=True, hops=2)
         self.login_attempts(1, chain)
-        self.assertIn("login:6.6.6.6:ghost", server.RATE)
+        self.assertIn("login:6.6.6.6:ghost", server.rate_keys())
 
     def test_cookie_is_not_secure_by_default(self):
         cookie, h = self.signup_cookie("plain_one", {"X-Forwarded-Proto": "https"})  # header ignored: not trusted
@@ -491,6 +533,224 @@ class HostingTest(unittest.TestCase):
         self.assertEqual(Client(self.port).request("POST", "/api/login", body, headers=public)[0], 401)  # let through
         forged = {"Origin": "https://evil.example", "X-Forwarded-Host": "rub.example"}
         self.assertEqual(Client(self.port).request("POST", "/api/login", body, headers=forged)[0], 403)
+
+
+class QuietWsgiHandler(WSGIRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+class WsgiAppTest(AppTest):
+    """Every API test again, this time behind the WSGI entry point that Vercel uses
+    (served here by wsgiref), including the lazy "cold start" set-up on the first request."""
+
+    @classmethod
+    def prepare_database(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        server.configure(cls.tmp.name)
+        server.ensure_ready(force=True)  # what the first request on a cold serverless instance does
+
+    @classmethod
+    def start_server(cls):
+        cls.httpd = make_wsgi_server("127.0.0.1", 0, server.wsgi_app, handler_class=QuietWsgiHandler)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    def test_vercel_rewrites_pass_the_real_path_as_rr_path(self):
+        c = self.client()
+        # vercel.json sends /api/reviews?limit=1 to the function as /api/index?rr_path=/api/reviews&limit=1
+        status, body, _ = c.request("GET", "/api/index?rr_path=/api/reviews&limit=1")
+        self.assertEqual((status, len(body["reviews"])), (200, 1))
+        self.assertGreater(body["total"], 1)  # and the other query parameters survive
+        self.assertEqual(c.request("GET", "/api/index?rr_path=/healthz")[1], {"ok": True})
+        self.assertEqual(c.request("GET", "/api/index?rr_path=/api/users/claude")[1]["user"]["username"], "claude")
+        status, data, h = c.request("GET", "/api/index?rr_path=/uploads/" + "0" * 24 + ".png")
+        self.assertEqual(status, 404)  # a well-formed photo name that doesn't exist
+        # a rewrite target must stay inside our own routes
+        self.assertEqual(c.request("GET", "/api/index?rr_path=/etc/passwd")[0], 404)
+        self.assertEqual(c.request("GET", "/api/index")[0], 404)
+
+    def test_rewritten_post_keeps_body_cookies_and_headers(self):
+        c = self.client()
+        status, body, h = c.request("POST", "/api/index?rr_path=/api/signup", {"username": "vercel_one", "password": "hunter2hunter2"})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(c.request("GET", "/api/index?rr_path=/api/me")[1]["user"]["username"], "vercel_one")
+
+    def test_database_not_configured_is_a_clear_503(self):
+        saved = db.settings()
+        try:
+            db.configure(sqlite_path=None)  # nothing to connect to, like a Vercel project without a database
+            status, body, _ = self.client().request("GET", "/api/me")
+            self.assertEqual((status, body["error"]), (503, "database_not_configured"))
+            self.assertEqual(self.client().request("GET", "/healthz")[0], 503)
+        finally:
+            db.configure(*saved)  # exactly what was there before (SQLite or Postgres)
+
+
+@unittest.skipUnless(os.environ.get("RUBRUB_TEST_DATABASE_URL") and db.psycopg,
+                     "set RUBRUB_TEST_DATABASE_URL (a DISPOSABLE postgres:// database) and install psycopg to run")
+class PostgresAppTest(AppTest):
+    """Every API test again on a real Postgres. WARNING: it drops Rub rub's tables in that database."""
+
+    @classmethod
+    def prepare_database(cls):
+        cls.previous = server.DATA_DIR
+        server.use_postgres(os.environ["RUBRUB_TEST_DATABASE_URL"])
+        con = server.connect()
+        try:
+            con.execute("DROP TABLE IF EXISTS likes, photos, rate_hits, sessions, reviews, users, meta CASCADE")
+            con.commit()
+        finally:
+            con.close()
+        server.init_db()
+        con = server.connect()
+        try:
+            server.seed(con)
+        finally:
+            con.close()
+
+    @classmethod
+    def cleanup_database(cls):
+        server.configure(cls.previous)  # back to SQLite for the tests that follow
+
+    def test_engine_really_is_postgres(self):
+        self.assertEqual(db.engine(), "postgres")
+        con = server.connect()
+        try:
+            self.assertEqual(con.engine, "postgres")
+            self.assertIn("PostgreSQL", con.execute("SELECT version()").fetchone()[0])
+        finally:
+            con.close()
+
+
+class PostgresWsgiAppTest(PostgresAppTest, WsgiAppTest):
+    """Exactly what runs on Vercel: the WSGI app on Postgres, configured only from Vercel-style
+    environment variables (VERCEL=1 and DATABASE_URL), with the lazy cold-start set-up."""
+
+    @classmethod
+    def prepare_database(cls):
+        from unittest import mock
+
+        cls.previous = server.DATA_DIR
+        url = os.environ["RUBRUB_TEST_DATABASE_URL"]
+        cls.environ = mock.patch.dict(os.environ, {"VERCEL": "1", "DATABASE_URL": url})
+        cls.environ.start()
+        server.use_postgres(url)
+        con = server.connect()
+        try:
+            con.execute("DROP TABLE IF EXISTS likes, photos, rate_hits, sessions, reviews, users, meta CASCADE")
+            con.commit()
+        finally:
+            con.close()
+        server.ensure_ready(force=True)  # picks Postgres up from DATABASE_URL, creates the tables, seeds
+
+    @classmethod
+    def cleanup_database(cls):
+        cls.environ.stop()
+        server.configure_proxy()
+        server.configure(cls.previous)
+
+    def test_vercel_environment_was_applied(self):
+        self.assertTrue(server.TRUST_PROXY)  # Vercel sits in front of the app
+        self.assertEqual(db.engine(), "postgres")
+
+    def test_visitor_ip_and_https_come_from_vercels_headers(self):
+        c = self.client()
+        status, body, h = c.request("POST", "/api/signup", {"username": "edge_user", "password": "hunter2hunter2"},
+                                    headers={"X-Forwarded-For": "203.0.113.77", "X-Forwarded-Proto": "https"})
+        self.assertEqual(status, 201, body)
+        self.assertIn("; Secure", h.get_all("Set-Cookie")[0])
+        self.assertIn("signup:203.0.113.77", server.rate_keys())  # limited per real visitor, not per proxy
+
+
+class DatabaseLayerTest(unittest.TestCase):
+    """db.py: the small layer that lets the same SQL run on SQLite and Postgres."""
+
+    def test_postgres_url_comes_from_the_first_matching_variable(self):
+        pick = db.postgres_url_from_env
+        self.assertIsNone(pick({}))
+        self.assertIsNone(pick({"DATABASE_URL": "sqlite:///x.db", "POSTGRES_URL": ""}))  # not a postgres URL
+        self.assertEqual(pick({"POSTGRES_URL": "postgres://a/b"}), "postgres://a/b")
+        self.assertEqual(pick({"DATABASE_URL": "postgresql://pooled/x", "POSTGRES_URL": "postgres://other/y"}), "postgresql://pooled/x")
+        self.assertEqual(pick({"RUBRUB_DATABASE_URL": "postgres://mine/z", "DATABASE_URL": "postgres://o/p"}), "postgres://mine/z")
+
+    def test_placeholders_become_psycopg_style(self):
+        self.assertEqual(db._pg_sql("SELECT 1 WHERE a = ? AND b LIKE '%x' AND c = ?"),
+                         "SELECT 1 WHERE a = %s AND b LIKE '%%x' AND c = %s")
+
+    def test_schema_is_filled_in_for_each_engine(self):
+        sqlite_sql, pg_sql = db.schema_sql("sqlite"), db.schema_sql("postgres")
+        self.assertIn("INTEGER PRIMARY KEY AUTOINCREMENT", sqlite_sql)
+        self.assertIn("BLOB", sqlite_sql)
+        self.assertIn("BIGSERIAL PRIMARY KEY", pg_sql)
+        self.assertIn("BYTEA", pg_sql)
+        for sql in (sqlite_sql, pg_sql):
+            self.assertNotRegex(sql, r"[{}]")  # every placeholder was substituted
+            for table in ("users", "sessions", "reviews", "likes", "photos", "rate_hits", "meta"):
+                self.assertIn(f"CREATE TABLE IF NOT EXISTS {table} ", sql)
+
+    def test_row_behaves_like_sqlite3_row(self):
+        row = db.Row({"id": 0, "name": 1}, (7, "x"))
+        self.assertEqual((row["id"], row[0], row["name"], row[1], len(row), list(row), row.keys()), (7, 7, "x", "x", 2, [7, "x"], ["id", "name"]))
+        self.assertEqual(row[0:2], (7, "x"))
+        with self.assertRaises(KeyError):
+            row["nope"]
+
+    def test_meta_round_trip_and_upsert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = server.DATA_DIR
+            try:
+                server.configure(tmp)
+                server.init_db()
+                con = server.connect()
+                try:
+                    self.assertIsNone(db.get_meta(con, "k"))
+                    db.set_meta(con, "k", 1)
+                    db.set_meta(con, "k", 2)  # second write replaces the first
+                    self.assertEqual(db.get_meta(con, "k"), "2")
+                finally:
+                    con.close()
+            finally:
+                server.configure(old)
+
+    def test_unconfigured_database_raises_a_clear_error(self):
+        old = server.DATA_DIR
+        try:
+            db.configure(sqlite_path=None)
+            with self.assertRaises(db.DatabaseNotConfigured):
+                db.connect()
+        finally:
+            server.configure(old)
+
+
+class VercelEnvironmentTest(unittest.TestCase):
+    """How the app configures itself when it finds Vercel's environment."""
+
+    def tearDown(self):
+        server.configure_proxy()
+        server.configure(server.DATA_DIR)  # back to SQLite
+
+    def test_vercel_without_a_database_says_what_to_do(self):
+        with self.assertRaises(db.DatabaseNotConfigured) as ctx:
+            server.apply_environment({"VERCEL": "1"})
+        self.assertIn("Postgres", str(ctx.exception))
+
+    def test_vercel_with_a_database_trusts_the_proxy_and_uses_postgres(self):
+        server.apply_environment({"VERCEL": "1", "POSTGRES_URL": "postgres://u:p@host/db?sslmode=require"})
+        self.assertEqual(db.engine(), "postgres")
+        self.assertTrue(server.TRUST_PROXY)  # Vercel always sits in front and overwrites X-Forwarded-For
+        self.assertEqual(server.PROXY_HOPS, 1)
+
+    def test_plain_environment_changes_nothing(self):
+        server.configure_proxy()
+        server.apply_environment({})
+        self.assertEqual(db.engine(), "sqlite")
+        self.assertFalse(server.TRUST_PROXY)
+
+    def test_explicit_settings_win_over_vercel_defaults(self):
+        server.apply_environment({"VERCEL": "1", "DATABASE_URL": "postgres://h/d", "RUBRUB_TRUST_PROXY": "0", "RUBRUB_PROXY_HOPS": "2"})
+        self.assertFalse(server.TRUST_PROXY)
+        self.assertEqual(server.PROXY_HOPS, 2)
 
 
 class ConfigTest(unittest.TestCase):
@@ -585,6 +845,60 @@ class ConfigTest(unittest.TestCase):
         server.drop_privileges(10001)  # must neither raise nor chown anything
 
 
+class DeployFilesTest(unittest.TestCase):
+    """The deployment files must agree with the code (a typo here only shows up after deploying)."""
+
+    root = Path(__file__).resolve().parent.parent
+
+    def read(self, name):
+        return (self.root / name).read_text(encoding="utf-8")
+
+    def test_vercel_config_matches_the_app(self):
+        cfg = json.loads(self.read("vercel.json"))
+        self.assertEqual(cfg["outputDirectory"], "public")  # the CDN serves the same folder the built-in server does
+        self.assertEqual(server.STATIC_DIR, self.root / "public")
+        self.assertTrue((self.root / "public" / "index.html").is_file())
+        self.assertIn("sin1", cfg["regions"])
+        sources = {r["source"] for r in cfg["rewrites"]}
+        self.assertEqual(sources, {"/api/:path*", "/uploads/:name", "/healthz"})  # every dynamic route of the app
+        for rule in cfg["rewrites"]:
+            dest, _, real = rule["destination"].partition("?rr_path=")
+            self.assertEqual(dest, "/api/index")  # the one function
+            self.assertTrue(real.startswith(server.API_PREFIXES), real)  # request_target() accepts the real path
+            self.assertIn({"type": "query", "key": "rr_path"}, rule["missing"])  # never rewrite a rewrite (no loops)
+        self.assertTrue((self.root / "api" / "index.py").is_file())
+
+    def test_vercel_security_headers_match_the_ones_the_server_sends(self):
+        rule = json.loads(self.read("vercel.json"))["headers"][0]
+        self.assertEqual({h["key"]: h["value"] for h in rule["headers"]}, server.SECURITY_HEADERS)
+        pattern = re.compile(rule["source"])  # static files get them, the function adds its own
+        for path in ("/", "/js/app.js", "/sw.js", "/icons/icon-192.png"):
+            self.assertTrue(pattern.fullmatch(path), path)
+        for path in ("/api/me", "/uploads/x.png", "/healthz"):
+            self.assertFalse(pattern.fullmatch(path), path)
+
+    def test_vercel_function_is_the_wsgi_app(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("vercel_entry_point", self.root / "api" / "index.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertIs(module.app, server.wsgi_app)
+        exclude = json.loads(self.read("vercel.json"))["functions"]["api/index.py"]["excludeFiles"]
+        for needed in ("rubrub.py", "db.py", "api/"):
+            self.assertNotIn(needed, exclude)  # never leave out what the function imports
+        self.assertIn("psycopg", self.read("requirements.txt"))
+
+    def test_dockerfile_copies_the_files_the_app_needs(self):
+        dockerfile, ignore = self.read("Dockerfile"), self.read(".dockerignore").split()
+        self.assertIn("COPY rubrub.py db.py ./", dockerfile)
+        self.assertIn("COPY public ./public", dockerfile)
+        self.assertIn('CMD ["python", "rubrub.py"]', dockerfile)
+        for needed in ("rubrub.py", "db.py", "public"):
+            self.assertNotIn(needed, ignore)
+        self.assertTrue((self.root / "start.bat").read_text().count("rubrub.py") == 1)
+
+
 class UpgradeTest(unittest.TestCase):
     """A database made before categories / the tester profile existed keeps working."""
 
@@ -595,9 +909,9 @@ class UpgradeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 server.configure(tmp)
-                old_schema = server.SCHEMA.replace("    category        TEXT NOT NULL DEFAULT 'other',\n", "")
-                self.assertNotEqual(old_schema, server.SCHEMA)
-                (Path(tmp) / "uploads").mkdir()
+                current = db.schema_sql("sqlite")
+                old_schema = current.replace("    category        TEXT NOT NULL DEFAULT 'other',\n", "")
+                self.assertNotEqual(old_schema, current)
                 con = sqlite3.connect(Path(tmp) / "rubrub.db")
                 con.executescript(old_schema)
                 con.execute("INSERT INTO users(id, username, display_name, bio, is_featured, created_at) VALUES(1,'claude','Claude','',1,0)")
@@ -619,6 +933,29 @@ class UpgradeTest(unittest.TestCase):
                     self.assertEqual(con.execute(
                         "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id WHERE u.username = 'test_blogger'").fetchone()[0], 6)
                     self.assertFalse(server.seed(con))
+                finally:
+                    con.close()
+            finally:
+                server.configure(old_dir)
+
+    def test_seed_marker_from_the_old_file_header_is_respected(self):
+        """Before the meta table existed the seed version lived in SQLite's user_version."""
+        import sqlite3
+
+        old_dir = server.DATA_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                server.configure(tmp)
+                server.init_db()
+                raw = sqlite3.connect(Path(tmp) / "rubrub.db")
+                raw.execute(f"PRAGMA user_version = {server.SEED_VERSION}")
+                raw.commit()
+                raw.close()
+                con = server.connect()
+                try:
+                    self.assertEqual(server.seed_version(con), server.SEED_VERSION)
+                    self.assertFalse(server.seed(con))  # already seeded in the past: stay out of the way
+                    self.assertEqual(con.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
                 finally:
                     con.close()
             finally:

@@ -1,0 +1,8 @@
+tests
+data
+.venv
+.claude
+Dockerfile
+.dockerignore
+render.yaml
+start.bat

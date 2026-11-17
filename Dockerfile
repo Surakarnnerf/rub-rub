@@ -14,8 +14,8 @@ ENV PYTHONUNBUFFERED=1 \
     RUBRUB_RUN_AS_UID=10001
 
 WORKDIR /app
-COPY server.py ./
-COPY static ./static
+COPY rubrub.py db.py ./
+COPY public ./public
 
 # The app starts as root only so it can fix the ownership of a freshly mounted volume (hosts
 # usually mount them root-owned), then it switches to the unprivileged user 10001.
@@ -28,4 +28,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/healthz',timeout=4)"]
 
-CMD ["python", "server.py"]
+CMD ["python", "rubrub.py"]

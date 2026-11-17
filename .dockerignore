@@ -3,8 +3,13 @@
 .gitattributes
 .claude
 .dockerignore
+.vercelignore
+.venv
 Dockerfile
 render.yaml
+vercel.json
+requirements.txt
+api
 data
 **/__pycache__
 *.pyc
