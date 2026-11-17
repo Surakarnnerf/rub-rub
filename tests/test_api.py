@@ -1,6 +1,9 @@
 """API tests for Rub rub. Run from the project folder:  python -m unittest discover tests -v"""
+import contextlib
 import http.client
+import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -348,6 +351,141 @@ class AppTest(unittest.TestCase):
             s, _, _ = c.request("GET", evil)
             self.assertEqual(s, 404, evil)
         self.assertEqual(c.request("GET", "/api/nope")[0], 404)
+
+
+class HostingTest(unittest.TestCase):
+    """Behaviour that matters once the app sits behind a hosting platform's proxy."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        server.configure(cls.tmp.name)
+        server.init_db()
+        cls.httpd = server.make_server("127.0.0.1", 0)
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        server.RATE.clear()
+        server.configure_proxy()
+
+    def tearDown(self):
+        server.configure_proxy()
+
+    def login_attempts(self, n, xff):
+        return [
+            Client(self.port).request("POST", "/api/login", {"username": "ghost", "password": "x"},
+                                      headers={"X-Forwarded-For": xff(i)})[0]
+            for i in range(n)
+        ]
+
+    def signup_cookie(self, username, headers=None):
+        status, body, h = Client(self.port).request(
+            "POST", "/api/signup", {"username": username, "password": "hunter2hunter2"}, headers=headers)
+        self.assertEqual(status, 201, body)
+        return h.get_all("Set-Cookie")[0], h
+
+    def test_healthz(self):
+        status, body, _ = Client(self.port).request("GET", "/healthz")
+        self.assertEqual((status, body), (200, {"ok": True}))
+        self.assertEqual(Client(self.port).request("POST", "/healthz")[0], 405)
+
+    def test_forwarded_for_is_ignored_unless_the_proxy_is_trusted(self):
+        codes = self.login_attempts(10, lambda i: f"10.0.0.{i}")  # forged headers must not dodge the limit
+        self.assertEqual(codes[:8], [401] * 8)
+        self.assertEqual(codes[8], 429)
+
+    def test_trusted_proxy_gives_each_visitor_their_own_limit(self):
+        server.configure_proxy(trust=True)
+        self.assertNotIn(429, self.login_attempts(10, lambda i: f"10.0.0.{i}"))
+        server.RATE.clear()
+        self.assertEqual(self.login_attempts(10, lambda i: "203.0.113.9")[8], 429)  # the same visitor is still limited
+
+    def test_proxy_hops_pick_the_address_the_proxy_added(self):
+        chain = lambda i: "6.6.6.6, 203.0.113.5"  # the left entry is whatever the visitor claimed
+        server.configure_proxy(trust=True, hops=1)
+        self.login_attempts(1, chain)
+        self.assertIn("login:203.0.113.5:ghost", server.RATE)
+        self.assertNotIn("login:6.6.6.6:ghost", server.RATE)
+        server.RATE.clear()
+        server.configure_proxy(trust=True, hops=2)
+        self.login_attempts(1, chain)
+        self.assertIn("login:6.6.6.6:ghost", server.RATE)
+
+    def test_cookie_is_not_secure_by_default(self):
+        cookie, h = self.signup_cookie("plain_one", {"X-Forwarded-Proto": "https"})  # header ignored: not trusted
+        self.assertIn("HttpOnly", cookie)
+        self.assertNotIn("Secure", cookie)
+        self.assertIsNone(h.get("Strict-Transport-Security"))
+
+    def test_cookie_is_secure_behind_an_https_proxy(self):
+        server.configure_proxy(trust=True)
+        cookie, h = self.signup_cookie("secure_one", {"X-Forwarded-Proto": "https"})
+        self.assertIn("; Secure", cookie)
+        self.assertIn("max-age", h["Strict-Transport-Security"])
+        cookie, h = self.signup_cookie("secure_two")  # no header: plain http, e.g. running locally
+        self.assertNotIn("Secure", cookie)
+        self.assertIsNone(h.get("Strict-Transport-Security"))
+
+    def test_secure_cookies_can_be_forced(self):
+        server.configure_proxy(secure=True)
+        cookie, h = self.signup_cookie("forced_one")
+        self.assertIn("; Secure", cookie)
+        self.assertIn("Strict-Transport-Security", h)
+
+    def test_origin_check_allows_the_public_host_name_only_through_a_trusted_proxy(self):
+        body = {"username": "nobody", "password": "x"}
+        public = {"Origin": "https://rub.example", "X-Forwarded-Host": "rub.example"}
+        self.assertEqual(Client(self.port).request("POST", "/api/login", body, headers=public)[0], 403)
+        server.configure_proxy(trust=True)
+        self.assertEqual(Client(self.port).request("POST", "/api/login", body, headers=public)[0], 401)  # let through
+        forged = {"Origin": "https://evil.example", "X-Forwarded-Host": "rub.example"}
+        self.assertEqual(Client(self.port).request("POST", "/api/login", body, headers=forged)[0], 403)
+
+
+class ConfigTest(unittest.TestCase):
+    """Command-line options and the environment variables hosting platforms use."""
+
+    def test_defaults_are_local_only(self):
+        a = server.parse_args([], {})
+        self.assertEqual((a.host, a.port, a.proxy_hops), ("127.0.0.1", 8000, 1))
+        self.assertFalse(any([a.trust_proxy, a.no_seed, a.secure_cookies, a.on_platform]))
+        self.assertIsNone(a.data_dir)
+        self.assertIsNone(a.run_as_uid)
+
+    def test_platform_environment(self):
+        a = server.parse_args([], {
+            "PORT": "10000", "RUBRUB_DATA_DIR": "/data", "RUBRUB_TRUST_PROXY": "1", "RUBRUB_SEED": "0",
+            "RUBRUB_PROXY_HOPS": "2", "RUBRUB_SECURE_COOKIES": "true", "RUBRUB_RUN_AS_UID": "10001"})
+        self.assertEqual((a.host, a.port, a.data_dir), ("0.0.0.0", 10000, "/data"))  # a PORT means "public server"
+        self.assertEqual((a.trust_proxy, a.no_seed, a.proxy_hops, a.secure_cookies), (True, True, 2, True))
+        self.assertEqual((a.run_as_uid, a.on_platform), (10001, True))
+
+    def test_flags_beat_the_environment(self):
+        a = server.parse_args(["--port", "9000", "--host", "127.0.0.1"], {"PORT": "10000", "RUBRUB_HOST": "0.0.0.0"})
+        self.assertEqual((a.host, a.port), ("127.0.0.1", 9000))
+
+    def test_bad_values_are_rejected(self):
+        for env in ({"PORT": "99999"}, {"PORT": "abc"}, {"RUBRUB_PROXY_HOPS": "0"}):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                server.parse_args([], env)
+
+    def test_env_flag(self):
+        for raw, want in (("1", True), ("true", True), ("YES", True), ("on", True), ("0", False), ("no", False), ("", False)):
+            self.assertEqual(server.env_flag("X", False, {"X": raw}), want, raw)
+        self.assertTrue(server.env_flag("X", True, {}))  # unset or blank falls back to the default
+        self.assertTrue(server.env_flag("X", True, {"X": " "}))
+
+    def test_drop_privileges_does_nothing_without_root(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("running as root")
+        server.drop_privileges(10001)  # must neither raise nor chown anything
 
 
 class UpgradeTest(unittest.TestCase):

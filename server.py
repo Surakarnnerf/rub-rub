@@ -6,6 +6,10 @@ Zero-dependency server (Python 3.9+, standard library only).
     python server.py                       # http://127.0.0.1:8000
     python server.py --host 0.0.0.0        # share on your local network
     python server.py --reset-password NAME # set/reset a user's password
+
+Hosting (Render, Railway, Fly.io, a VPS...) is configured with environment variables, see
+README.md: PORT, RUBRUB_DATA_DIR, RUBRUB_TRUST_PROXY, RUBRUB_PROXY_HOPS, RUBRUB_SECURE_COOKIES,
+RUBRUB_SEED, RUBRUB_HOST, RUBRUB_RUN_AS_UID.  GET /healthz is the health-check endpoint.
 """
 from __future__ import annotations
 
@@ -14,8 +18,10 @@ import getpass
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
+import signal
 import sqlite3
 import sys
 import threading
@@ -39,6 +45,41 @@ def configure(data_dir) -> None:
     DATA_DIR = Path(data_dir).resolve()
     DB_PATH = DATA_DIR / "rubrub.db"
     UPLOAD_DIR = DATA_DIR / "uploads"
+
+
+# Reverse-proxy settings. Hosting platforms put a proxy in front of the app, and that is where
+# HTTPS ends and where the visitor's real IP is only visible in X-Forwarded-* headers. These are
+# OFF by default because any client can forge such headers when it talks to the server directly.
+TRUST_PROXY = False
+PROXY_HOPS = 1  # how many trusted proxies sit in front of the app
+FORCE_SECURE = False  # always mark the session cookie Secure
+
+
+def configure_proxy(trust: bool = False, hops: int = 1, secure: bool = False) -> None:
+    global TRUST_PROXY, PROXY_HOPS, FORCE_SECURE
+    TRUST_PROXY, PROXY_HOPS, FORCE_SECURE = bool(trust), max(1, int(hops)), bool(secure)
+
+
+def env_flag(name: str, default: bool = False, environ=None) -> bool:
+    value = (os.environ if environ is None else environ).get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def drop_privileges(uid: int) -> None:
+    """Containers start as root and a freshly mounted volume is usually owned by root. Fix the
+    ownership of the data folder, then carry on as an unprivileged user. No-op unless root."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if DATA_DIR.stat().st_uid != uid:
+        os.chown(DATA_DIR, uid, uid)
+        for p in DATA_DIR.rglob("*"):
+            os.chown(p, uid, uid, follow_symlinks=False)
+    os.setgroups([])
+    os.setgid(uid)
+    os.setuid(uid)
 
 
 # --------------------------------------------------------------------------
@@ -500,7 +541,7 @@ def start_session(h: "Handler", user_id: int) -> None:
         "INSERT INTO sessions(token_hash, user_id, expires_at) VALUES(?,?,?)",
         (hashlib.sha256(token.encode()).hexdigest(), user_id, now + SESSION_TTL),
     )
-    h.cookies.append(f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}")
+    h.cookies.append(f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{h.secure_flag()}")
 
 
 @route("GET", "/api/me")
@@ -510,7 +551,7 @@ def api_me(h, q):
 
 @route("POST", "/api/signup")
 def api_signup(h, q):
-    if not rate_ok(f"signup:{h.client_address[0]}", 20, 3600):
+    if not rate_ok(f"signup:{h.client_ip()}", 20, 3600):
         raise ApiError(429, "rate_limited")
     d = h.read_json()
     errors = {}
@@ -546,7 +587,7 @@ def api_login(h, q):
     d = h.read_json()
     username = str(d.get("username") or "").strip()
     password = d.get("password")
-    key = f"login:{h.client_address[0]}:{username.lower()}"
+    key = f"login:{h.client_ip()}:{username.lower()}"
     if not rate_ok(key, 8, 600):
         raise ApiError(429, "rate_limited")
     row = h.con.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
@@ -565,7 +606,7 @@ def api_logout(h, q):
     token = h.session_token()
     if token:
         h.con.execute("DELETE FROM sessions WHERE token_hash = ?", (hashlib.sha256(token.encode()).hexdigest(),))
-    h.cookies.append(f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+    h.cookies.append(f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{h.secure_flag()}")
     return {"ok": True}
 
 
@@ -795,7 +836,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             url = urlsplit(self.path)
             path = unquote(url.path)
-            if path.startswith("/api/"):
+            if path == "/healthz":
+                self.health()
+            elif path.startswith("/api/"):
                 self.con = connect()
                 try:
                     result = self.dispatch_api(path, parse_qs(url.query))
@@ -836,14 +879,51 @@ class Handler(BaseHTTPRequestHandler):
                 return fn(self, query, *m.groups())
         raise ApiError(405, "method_not_allowed") if path_matched else ApiError(404, "not_found")
 
+    def health(self):
+        """Health check for hosting platforms: proves the process is up and the database opens."""
+        if self.command not in ("GET", "HEAD"):
+            raise ApiError(405, "method_not_allowed")
+        con = connect()
+        try:
+            con.execute("SELECT 1").fetchone()
+        finally:
+            con.close()
+        self.send_json({"ok": True})
+
+    # -- proxy awareness ------------------------------------------------------
+    def client_ip(self) -> str:
+        """The visitor's address. Behind a trusted proxy that is read from X-Forwarded-For, counting
+        from the right (the proxy's own entries are the ones that can be trusted, the left side can
+        be forged by the visitor)."""
+        if TRUST_PROXY:
+            parts = [p.strip() for p in (self.headers.get("X-Forwarded-For") or "").split(",") if p.strip()]
+            if parts:
+                return parts[max(0, len(parts) - PROXY_HOPS)][:64]
+        return self.client_address[0]
+
+    def is_https(self) -> bool:
+        if FORCE_SECURE:
+            return True
+        if TRUST_PROXY:
+            proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+            return proto == "https"
+        return False
+
+    def secure_flag(self) -> str:
+        return "; Secure" if self.is_https() else ""
+
     def check_csrf(self):
         if self.command in ("GET", "HEAD"):
             return
         if self.headers.get("X-Requested-With") != "rubrub":
             raise ApiError(403, "csrf")
         origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).netloc != self.headers.get("Host"):
-            raise ApiError(403, "csrf")
+        if origin:
+            allowed = {self.headers.get("Host")}
+            if TRUST_PROXY:  # some proxies rewrite Host and pass the public name on instead
+                allowed.add((self.headers.get("X-Forwarded-Host") or "").split(",")[0].strip() or None)
+            if urlsplit(origin).netloc not in allowed:
+                raise ApiError(403, "csrf")
 
     def read_body(self, limit: int) -> bytes:
         self._body_read = True
@@ -921,6 +1001,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in SECURITY_HEADERS.items():
             self.send_header(k, v)
+        if self.is_https():
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         for c in self.cookies:
@@ -959,6 +1041,7 @@ class Handler(BaseHTTPRequestHandler):
 
 class RubServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 64
     # On Windows SO_REUSEADDR lets a second process steal the port; keep it off there.
     allow_reuse_address = sys.platform != "win32"
 
@@ -1170,17 +1253,45 @@ def reset_password(username: str) -> int:
         con.close()
 
 
-def main(argv=None) -> int:
+def parse_args(argv=None, environ=None):
+    """Command-line options. Each one can also come from an environment variable (what hosting
+    platforms use); an explicit flag always wins."""
+    env = os.environ if environ is None else environ
+    on_platform = bool(env.get("PORT"))  # Render, Railway, Fly.io, Heroku... all hand us a PORT
     ap = argparse.ArgumentParser(description="Rub rub - Thai street food reviews")
-    ap.add_argument("--host", default="127.0.0.1", help="interface to bind (default 127.0.0.1; use 0.0.0.0 for LAN)")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--data-dir", help="where to keep the database and photos (default ./data)")
-    ap.add_argument("--no-seed", action="store_true", help="don't create the sample Claude blogger + reviews")
+    ap.add_argument("--host", default=env.get("RUBRUB_HOST") or ("0.0.0.0" if on_platform else "127.0.0.1"),
+                    help="interface to bind (default 127.0.0.1, or 0.0.0.0 when PORT is set) [RUBRUB_HOST]")
+    ap.add_argument("--port", type=int, default=env.get("PORT") or "8000", help="port to listen on [PORT]")
+    ap.add_argument("--data-dir", default=env.get("RUBRUB_DATA_DIR") or None,
+                    help="where to keep the database and photos (default ./data) [RUBRUB_DATA_DIR]")
+    ap.add_argument("--no-seed", action="store_true", default=not env_flag("RUBRUB_SEED", True, env),
+                    help="don't create the sample Claude blogger + reviews [RUBRUB_SEED=0]")
+    ap.add_argument("--trust-proxy", action="store_true", default=env_flag("RUBRUB_TRUST_PROXY", False, env),
+                    help="behind a reverse proxy: read the visitor IP and HTTPS from X-Forwarded-* [RUBRUB_TRUST_PROXY=1]")
+    ap.add_argument("--proxy-hops", type=int, default=env.get("RUBRUB_PROXY_HOPS") or "1",
+                    help="number of trusted proxies in front of the app (default 1) [RUBRUB_PROXY_HOPS]")
+    ap.add_argument("--secure-cookies", action="store_true", default=env_flag("RUBRUB_SECURE_COOKIES", False, env),
+                    help="always mark the login cookie Secure (HTTPS only) [RUBRUB_SECURE_COOKIES=1]")
+    ap.add_argument("--run-as-uid", type=int, default=env.get("RUBRUB_RUN_AS_UID") or None,
+                    help="when started as root, fix data-folder ownership then switch to this user id [RUBRUB_RUN_AS_UID]")
     ap.add_argument("--reset-password", metavar="USERNAME", help="set a new password for a user, then exit")
     args = ap.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        ap.error("--port must be between 1 and 65535")
+    if args.proxy_hops < 1:
+        ap.error("--proxy-hops must be at least 1")
+    args.on_platform = on_platform
+    return args
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
 
     if args.data_dir:
         configure(args.data_dir)
+    configure_proxy(args.trust_proxy, args.proxy_hops, args.secure_cookies)
+    if args.run_as_uid is not None:
+        drop_privileges(args.run_as_uid)  # before touching the database, so its files get the right owner
     init_db()
     if args.reset_password:
         return reset_password(args.reset_password)
@@ -1194,14 +1305,32 @@ def main(argv=None) -> int:
     cleanup_orphan_uploads()
 
     server = make_server(args.host, args.port)
+
+    def stop(*_):  # SIGTERM is how containers and hosts ask us to shut down
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), stop)
+            except (ValueError, OSError):
+                pass
+
     shown = "localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host
-    print(f"Rub rub is sizzling at http://{shown}:{server.server_address[1]}  (Ctrl+C to stop)")
-    if args.host == "0.0.0.0":
-        print("Listening on all interfaces: anyone on your network can reach it. No HTTPS here.")
+    print(f"Rub rub is sizzling at http://{shown}:{server.server_address[1]}  (Ctrl+C to stop)", flush=True)
+    print(f"Data folder: {DATA_DIR}", flush=True)
+    if args.trust_proxy:
+        print(f"Trusting {args.proxy_hops} reverse proxy hop(s) for visitor IP and HTTPS.", flush=True)
+    elif args.on_platform:
+        print("WARNING: PORT is set, so this looks like a hosting platform, but --trust-proxy is off. "
+              "Every visitor will share one IP for rate limits and cookies won't be Secure. "
+              "Set RUBRUB_TRUST_PROXY=1.", flush=True)
+    elif args.host == "0.0.0.0":
+        print("Listening on all interfaces: anyone on your network can reach it. No HTTPS here.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nBye!")
+        print("\nBye!", flush=True)
     finally:
         server.server_close()
     return 0

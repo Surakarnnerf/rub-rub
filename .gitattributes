@@ -1,0 +1,4 @@
+# Docker builds break on CRLF line endings; Windows batch files need them.
+Dockerfile text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
