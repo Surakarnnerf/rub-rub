@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS users (
     pw_hash      TEXT,
     bio          TEXT NOT NULL DEFAULT '',
     is_featured  INTEGER NOT NULL DEFAULT 0,
+    is_expert    INTEGER NOT NULL DEFAULT 0,
+    expert_title TEXT NOT NULL DEFAULT '',
     created_at   {big} NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (lower(username));
@@ -245,6 +247,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     user_id         {big} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     restaurant_name TEXT NOT NULL,
     area            TEXT NOT NULL DEFAULT '',
+    city            TEXT NOT NULL DEFAULT 'other',
     menu_item       TEXT NOT NULL,
     category        TEXT NOT NULL DEFAULT 'other',
     rating          INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
@@ -267,6 +270,27 @@ CREATE TABLE IF NOT EXISTS likes (
     review_id {big} NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     PRIMARY KEY (user_id, review_id)
 );
+CREATE TABLE IF NOT EXISTS saves (
+    user_id    {big} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    review_id  {big} NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    created_at {big} NOT NULL,
+    PRIMARY KEY (user_id, review_id)
+);
+CREATE TABLE IF NOT EXISTS collections (
+    id          {pk},
+    user_id     {big} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    is_public   INTEGER NOT NULL DEFAULT 1,
+    created_at  {big} NOT NULL,
+    updated_at  {big} NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collection_items (
+    collection_id {big} NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    review_id     {big} NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    added_at      {big} NOT NULL,
+    PRIMARY KEY (collection_id, review_id)
+);
 CREATE TABLE IF NOT EXISTS photos (
     name         TEXT PRIMARY KEY,
     content_type TEXT NOT NULL,
@@ -284,13 +308,31 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_reviews_user ON reviews(user_id);
 CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);
 CREATE INDEX IF NOT EXISTS idx_rate_hits ON rate_hits(rkey, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS collections_user_name ON collections (user_id, lower(name));
+CREATE INDEX IF NOT EXISTS idx_collections_user ON collections(user_id);
+CREATE INDEX IF NOT EXISTS idx_saves_review ON saves(review_id);
 """
+# (the index on reviews(city) is created in rubrub.init_db, after an older table got its city column)
+
+
+# Every table the schema creates, children before parents (the tests use this to start from nothing).
+TABLE_NAMES = ("collection_items", "collections", "saves", "likes", "photos", "rate_hits", "sessions", "reviews", "users", "meta")
 
 
 def schema_sql(engine_name: str) -> str:
     if engine_name == "postgres":
         return _SCHEMA.format(pk="BIGSERIAL PRIMARY KEY", big="BIGINT", blob="BYTEA")
     return _SCHEMA.format(pk="INTEGER PRIMARY KEY AUTOINCREMENT", big="BIGINT", blob="BLOB")
+
+
+def column_exists(con: Connection, table: str, column: str) -> bool:
+    """Does the table already have this column? (used to upgrade older databases)"""
+    if con.engine == "sqlite":
+        return any(r["name"] == column for r in con.execute(f"PRAGMA table_info({table})"))
+    return con.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ? AND table_schema = current_schema()",
+        (table, column),
+    ).fetchone() is not None
 
 
 def get_meta(con: Connection, key: str) -> str | None:

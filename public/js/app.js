@@ -61,6 +61,13 @@
     badge: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.500l2.600 2 3.200-.3 1.100 3 2.800 1.700-.9 3.100.9 3.100-2.800 1.700-1.100 3-3.200-.3-2.600 2-2.600-2-3.200.3-1.100-3L2.300 14.700l.9-3.100-.9-3.100L5.100 6.800l1.100-3 3.200.3z"/><path d="M8 12.200l2.800 2.800L16.200 9.500" fill="none" stroke="#fff" stroke-width="2.200" stroke-linecap="round" stroke-linejoin="round"/></svg>',
     home: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 11.500L12 4l8 7.500V20a1 1 0 0 1-1 1h-4.500v-6h-5v6H5a1 1 0 0 1-1-1z"/></svg>',
     user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.400 3.600-7 8-7s8 2.600 8 7"/></svg>',
+    bookmark: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4.5L5 21V4a1 1 0 0 1 1-1z"/></svg>',
+    bookmarkO: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4.5L5 21V4a1 1 0 0 1 1-1z"/></svg>',
+    chef: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2.5a4.5 4.5 0 0 1 4.3 3.1A4 4 0 0 1 18 13.3V17a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1v-3.7a4 4 0 0 1 1.7-7.7A4.5 4.5 0 0 1 12 2.5z"/><rect x="7" y="19.5" width="10" height="2" rx="1"/></svg>',
+    ask: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.4 2.3c-.6.3-.9.7-.9 1.2"/><path d="M12 14.5v.1"/></svg>',
+    list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>',
+    check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+    lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
   };
   const icon = (name, cls) => el('span', { class: 'ic' + (cls ? ' ' + cls : ''), html: ICON[name] });
 
@@ -70,7 +77,7 @@
   const state = {
     user: null,
     next: null,
-    filters: { q: '', category: '', payment: '', min_rating: '', sort: 'new' },
+    filters: { q: '', category: '', city: '', expert: false, payment: '', min_rating: '', sort: 'new' },
   };
 
   class ApiErr extends Error {
@@ -147,6 +154,29 @@
   function catLabels(key) {
     return [t('cat.' + key), I18N[lang === 'th' ? 'en' : 'th']['cat.' + key]];
   }
+
+  /* destinations */
+  const CITIES = ['bangkok', 'chiang_mai', 'phuket', 'chonburi', 'hat_yai', 'ayutthaya', 'khon_kaen', 'chiang_rai', 'krabi', 'hua_hin', 'samui', 'other'];
+  const CITY_WORDS = [ // same order and words as CITY_KEYWORDS in rubrub.py
+    ['bangkok', ['bangkok', 'krung thep', 'กรุงเทพ', 'yaowarat', 'silom', 'sathorn', 'sukhumvit', 'thonglor', 'ratchada',
+      'chatuchak', 'phra nakhon', 'khao san', 'ratchathewi']],
+    ['chiang_mai', ['chiang mai', 'เชียงใหม่', 'nimman']],
+    ['phuket', ['phuket', 'ภูเก็ต']],
+    ['chonburi', ['chonburi', 'pattaya', 'ชลบุรี', 'พัทยา', 'bang saen']],
+    ['hat_yai', ['hat yai', 'hatyai', 'songkhla', 'หาดใหญ่', 'สงขลา']],
+    ['ayutthaya', ['ayutthaya', 'อยุธยา']],
+    ['khon_kaen', ['khon kaen', 'ขอนแก่น']],
+    ['chiang_rai', ['chiang rai', 'เชียงราย']],
+    ['krabi', ['krabi', 'กระบี่', 'ao nang']],
+    ['hua_hin', ['hua hin', 'หัวหิน']],
+    ['samui', ['samui', 'สมุย', 'surat thani', 'สุราษฎร์']],
+  ];
+  function guessCity(text) {
+    const s = (text || '').toLowerCase();
+    for (const [city, words] of CITY_WORDS) if (words.some((w) => s.includes(w))) return city;
+    return 'other';
+  }
+  const cityName = (slug) => t('city.' + slug);
 
   const overnight = (r) => r.close_time < r.open_time;
   const baht = (n) => '฿' + Number(n).toLocaleString('en-US');
@@ -257,9 +287,14 @@
   const fameLabel = (user) => (user.is_featured ? t('famousBlogger') : t('famous.reviewer'));
   function badge(user) { return el('span', { class: 'blogger-badge' }, icon('badge'), user ? fameLabel(user) : t('famousBlogger')); }
 
+  /** Experts are curated by the site owner (chefs, writers...). Members are everybody else, so only Experts get a mark. */
+  const expertLabel = (user) => t('expert') + (user.expert_title ? ' · ' + user.expert_title : '');
+  const expertBadge = (user) => el('span', { class: 'expert-badge' }, icon('chef'), expertLabel(user));
+
   function authorChip(author) {
     return el('a', { class: 'author', href: '#/user/' + encodeURIComponent(author.username) },
       avatar(author), el('span', { class: 'author-name' }, author.display_name),
+      author.is_expert && el('span', { class: 'ic chef-ic', title: expertLabel(author), 'aria-label': expertLabel(author), role: 'img', html: ICON.chef }),
       (author.is_featured || author.is_famous) && el('span', { class: 'ic badge-ic', title: fameLabel(author), html: ICON.badge }));
   }
 
@@ -301,7 +336,40 @@
     return btn;
   }
 
-  function reviewCard(r) {
+  /** Save for later: a private wishlist. onChange(saved) lets a page react (e.g. drop the card from the Saved list). */
+  function saveButton(r, onChange) {
+    const btn = el('button', { type: 'button', class: 'save' });
+    function paint() {
+      btn.classList.toggle('on', r.saved);
+      btn.setAttribute('aria-pressed', String(r.saved));
+      btn.setAttribute('aria-label', t('save'));
+      btn.title = t('save');
+      btn.replaceChildren(icon(r.saved ? 'bookmark' : 'bookmarkO'));
+    }
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      if (!state.user) { askLogin('loginToSave'); return; }
+      btn.disabled = true;
+      try {
+        const res = await api('POST', `/api/reviews/${r.id}/save`);
+        r.saved = res.saved;
+        toast(t(res.saved ? 'saveAdded' : 'saveRemoved'));
+        paint();
+        if (onChange) onChange(res.saved);
+      } catch (err) { handleErr(err); }
+      btn.disabled = false;
+    });
+    paint();
+    return btn;
+  }
+
+  function askLogin(messageKey) {
+    state.next = location.hash;
+    toast(t(messageKey));
+    location.hash = '#/login';
+  }
+
+  function reviewCard(r, opts = {}) {
     const href = '#/review/' + r.id;
     return el('article', { class: 'card' },
       el('a', { class: 'card-media', href, tabindex: '-1', 'aria-hidden': 'true' },
@@ -313,7 +381,9 @@
         el('div', { class: 'card-meta' }, flames(r.rating, `${r.rating}/5 · ${t('rate.' + r.rating)}`), el('span', { class: 'price' }, baht(r.price_thb))),
         payChips(r.payments),
         el('p', { class: 'hours' }, icon('clock'), el('span', null, hoursText(r))),
-        el('div', { class: 'card-foot' }, authorChip(r.author), likeButton(r))));
+        el('div', { class: 'card-foot' }, authorChip(r.author),
+          el('div', { class: 'card-actions' }, saveButton(r, opts.onSaveChange), likeButton(r))),
+        opts.extra));
   }
 
   const loadingNode = () => el('div', { class: 'loading' }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), t('loading'));
@@ -365,7 +435,9 @@
     $('#topbar').replaceChildren(el('div', { class: 'topbar-in' },
       el('a', { class: 'brand', href: '#/', 'aria-label': 'Rub rub' },
         el('span', { class: 'brand-mark', html: ICON.flame }), el('span', { class: 'brand-name' }, 'Rub rub')),
+      el('nav', { class: 'mainnav', id: 'mainnav', 'aria-label': 'Main' }),
       el('div', { class: 'topbar-actions' }, langToggle(), accountArea())));
+    renderNav();
     $('#footer').replaceChildren(el('div', { class: 'wrap footer-in' },
       el('strong', null, 'Rub rub'), el('span', null, t('footer')),
       !PWA.standalone() && el('button', { class: 'link-btn footer-link', type: 'button', onClick: installApp }, t('install.footer'))));
@@ -385,8 +457,23 @@
     }, icon(ic), el('span', null, label));
     $('#tabbar').replaceChildren(
       tab('#/', 'home', t('nav.home'), path === '/'),
+      tab('#/ask', 'ask', t('tab.ask'), path === '/ask'),
       tab('#/new', 'plus', t('tab.write'), /^\/(new|edit)/.test(path), 'tab-write'),
+      tab('#/saved', 'bookmarkO', t('tab.saved'), path === '/saved'),
       tab(me ? '#/user/' + encodeURIComponent(me.username) : '#/login', 'user', me ? t('tab.me') : t('tab.signin'), meActive));
+  }
+
+  /** Main menu in the header (desktop; phones use the bottom bar). */
+  function renderNav() {
+    const nav = $('#mainnav');
+    if (!nav) return;
+    const path = (location.hash.replace(/^#/, '') || '/').split('?')[0];
+    const link = (href, ic, label, active) => el('a', { class: 'navlink' + (active ? ' on' : ''), href, 'aria-current': active ? 'page' : null }, icon(ic), label);
+    nav.replaceChildren(
+      link('#/ask', 'ask', t('nav.ask'), path === '/ask'),
+      link('#/cities', 'pin', t('nav.cities'), /^\/cit(y|ies)/.test(path)),
+      link('#/experts', 'chef', t('nav.experts'), path === '/experts'),
+      link('#/saved', 'bookmarkO', t('nav.saved'), path === '/saved'));
   }
 
   /* ------------------------------------------------------------------ */
@@ -402,14 +489,9 @@
   }
 
   function showInstallHelp() {
-    const dlg = el('dialog', { class: 'sheet', 'aria-labelledby': 'sheet-title' },
-      el('h2', { id: 'sheet-title' }, t('install.title')),
+    const dlg = openSheet(t('install.title'),
       el('p', null, PWA.ios() ? t('install.ios') : t('install.other')),
-      el('button', { class: 'btn btn-primary btn-block', type: 'button', onClick: () => dlg.close() }, t('install.gotIt')));
-    dlg.addEventListener('close', () => dlg.remove());
-    dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
-    document.body.append(dlg);
-    if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '');
+      el('button', { class: 'btn btn-primary btn-block', type: 'button', onClick: () => dlg.dismiss() }, t('install.gotIt')));
   }
 
   async function installApp() {
@@ -460,8 +542,10 @@
   /* ------------------------------------------------------------------ */
   /* Home                                                                */
   /* ------------------------------------------------------------------ */
-  function feedSection(onReady) {
-    const f = state.filters;
+  /** The searchable feed. opts.filters is its own filter state (default: the shared one on the home page),
+   *  opts.fixedCity hides the city picker on a city page, opts.title replaces the heading. */
+  function feedSection(opts = {}) {
+    const f = opts.filters || state.filters;
     const grid = el('div', { class: 'grid' });
     const count = el('p', { class: 'count', 'aria-live': 'polite' });
     const moreBtn = el('button', { class: 'btn btn-ghost', type: 'button', hidden: true }, t('loadMore'));
@@ -476,6 +560,8 @@
         const qs = new URLSearchParams({ limit: '9', offset: String(offset), sort: f.sort });
         if (f.q) qs.set('q', f.q);
         if (f.category) qs.set('category', f.category);
+        if (f.city) qs.set('city', f.city);
+        if (f.expert) qs.set('expert', '1');
         if (f.payment) qs.set('payment', f.payment);
         if (f.min_rating) qs.set('min_rating', f.min_rating);
         const res = await api('GET', '/api/reviews?' + qs);
@@ -526,8 +612,13 @@
       onClick: () => { f.payment = val; payBtns.forEach((b, i) => b.setAttribute('aria-pressed', String(payItems[i][0] === val))); load(true); },
     }, label));
 
-    const select = (id, label, opts, key) => {
-      const s = el('select', { class: 'input', id, 'aria-label': label }, opts.map(([v, text]) => el('option', { value: v }, text)));
+    const expertChip = el('button', {
+      type: 'button', class: 'chip chip-expert', 'aria-pressed': String(!!f.expert),
+      onClick: () => { f.expert = !f.expert; expertChip.setAttribute('aria-pressed', String(f.expert)); load(true); },
+    }, icon('chef'), t('filter.experts'));
+
+    const select = (id, label, choices, key) => {
+      const s = el('select', { class: 'input', id, 'aria-label': label }, choices.map(([v, text]) => el('option', { value: v }, text)));
       s.value = f[key];
       s.addEventListener('change', () => { f[key] = s.value; load(true); });
       return el('label', { class: 'select-wrap', for: id }, el('span', { class: 'select-label' }, label), s);
@@ -535,12 +626,14 @@
 
     const node = el('section', { class: 'wrap section', id: 'feed' },
       el('div', { class: 'section-head' },
-        el('h2', null, t('feed.title')), count),
+        el('h2', null, opts.title || t('feed.title')), count),
       el('div', { class: 'filters' },
         el('div', { class: 'search' }, icon('search'), search),
         el('div', { class: 'chips cats', role: 'group', 'aria-label': t('filter.category') }, catBtns),
-        el('div', { class: 'chips', role: 'group', 'aria-label': t('filter.payment') }, payBtns),
+        el('div', { class: 'chips', role: 'group', 'aria-label': t('filter.payment') }, [...payBtns, expertChip]),
         el('div', { class: 'selects' },
+          !opts.fixedCity && select('feed-city', t('filter.city'),
+            [['', t('filter.allCities')], ...CITIES.filter((c) => c !== 'other').map((c) => [c, cityName(c)]), ['other', cityName('other')]], 'city'),
           select('feed-rating', t('filter.rating'), [['', t('filter.any')], ['3', '3+'], ['4', '4+'], ['5', '5']], 'min_rating'),
           select('feed-sort', t('filter.sort'), [['new', t('sort.new')], ['top', t('sort.top')], ['cheap', t('sort.cheap')], ['liked', t('sort.liked')]], 'sort'))),
       grid,
@@ -556,9 +649,10 @@
 
   async function viewHome() {
     setTitle();
-    const [picks, famous] = await Promise.all([
+    const [picks, famous, cities] = await Promise.all([
       api('GET', '/api/reviews?featured=1&sort=top&limit=6').catch(() => ({ reviews: [] })),
       api('GET', '/api/users?limit=6').then((r) => r.users).catch(() => []),
+      api('GET', '/api/cities').then((r) => r.cities).catch(() => []),
     ]);
     let blogger = null;
     if (picks.reviews.length) {
@@ -583,6 +677,7 @@
       }, el('span', { 'aria-hidden': 'true' }, CAT_ICON[c]), catLabels(c)[0]))),
       el('div', { class: 'hero-cta' },
         el('a', { class: 'btn btn-cream', href: '#/new' }, icon('plus'), t('hero.write')),
+        el('a', { class: 'btn btn-outline-light', href: '#/ask' }, icon('ask'), t('hero.ask')),
         blogger && el('a', { class: 'btn btn-outline-light', href: '#/user/' + encodeURIComponent(blogger.username) }, t('hero.meet', { name: blogger.display_name })))));
 
     const frag = el('div', null, hero);
@@ -616,10 +711,27 @@
               u.avg_rating != null ? ' · ' + t('stat.avg', { n: u.avg_rating }) : '')))))));
     }
 
+    if (cities.some((c) => c.city !== 'other')) {
+      frag.append(el('section', { class: 'wrap section dest' },
+        el('div', { class: 'section-head' },
+          el('h2', null, '📍 ' + t('dest.title')),
+          el('a', { class: 'section-link', href: '#/cities' }, t('dest.all') + ' →')),
+        destinationRail(cities.filter((c) => c.city !== 'other').slice(0, 8))));
+    }
+
     frag.append(feed.node);
     feed.load(true);
     return frag;
   }
+
+  const CITY_COLOR = { bangkok: 0, chiang_mai: 1, phuket: 2, chonburi: 3, hat_yai: 4, ayutthaya: 5, khon_kaen: 6, chiang_rai: 7, krabi: 8, hua_hin: 9, samui: 10 };
+  function destinationCard(c) {
+    return el('a', { class: `dest-card dc-${(CITY_COLOR[c.city] ?? 11) % 6}`, href: '#/city/' + c.city },
+      el('span', { class: 'dest-pin', 'aria-hidden': 'true' }, '📍'),
+      el('strong', null, cityName(c.city)),
+      el('span', null, t('city.places', { n: c.count })));
+  }
+  const destinationRail = (list) => el('div', { class: 'rail dest-rail' }, list.map((c) => el('div', { class: 'dest-item' }, destinationCard(c))));
 
   /* ------------------------------------------------------------------ */
   /* Review detail                                                       */
@@ -632,6 +744,8 @@
 
     const actions = el('div', { class: 'detail-actions' },
       likeButton(r),
+      saveButton(r),
+      el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: () => openCollectionSheet(r) }, icon('list'), t('coll.add')),
       el('button', {
         class: 'btn btn-ghost btn-sm', type: 'button',
         onClick: async () => {
@@ -655,6 +769,7 @@
           el('div', { class: 'tags' }, r.is_sample && tag(t('sample'), 'tag-sample'), catTag(r), openTag(r)),
           el('h1', null, r.menu_item),
           el('p', { class: 'detail-sub' }, icon('pin'), el('span', null, r.restaurant_name + (r.area ? ' · ' + r.area : ''))),
+          r.city && r.city !== 'other' && el('a', { class: 'city-link', href: '#/city/' + r.city }, '📍 ' + cityName(r.city) + ' →'),
           el('div', { class: 'facts' },
             fact(t('detail.rating'), el('span', null, flames(r.rating, `${r.rating}/5`), ' ', el('strong', null, t('rate.' + r.rating)))),
             fact(t('detail.price'), el('strong', { class: 'big-price' }, baht(r.price_thb))),
@@ -682,14 +797,19 @@
   /* ------------------------------------------------------------------ */
   async function viewUser(username) {
     const { user } = await api('GET', '/api/users/' + encodeURIComponent(username));
-    const { reviews } = await api('GET', '/api/reviews?limit=50&sort=new&user=' + encodeURIComponent(user.username));
+    const [{ reviews }, { collections }] = await Promise.all([
+      api('GET', '/api/reviews?limit=50&sort=new&user=' + encodeURIComponent(user.username)),
+      api('GET', '/api/users/' + encodeURIComponent(user.username) + '/collections'),
+    ]);
     setTitle(user.display_name);
     const mine = state.user && state.user.username.toLowerCase() === user.username.toLowerCase();
     return el('div', { class: 'wrap profile' },
-      el('section', { class: 'profile-head' + (user.is_featured || user.is_famous ? ' featured' : '') },
+      el('section', { class: 'profile-head' + (user.is_featured || user.is_famous || user.is_expert ? ' featured' : '') },
         avatar(user, true),
         el('div', { class: 'profile-text' },
-          (user.is_featured || user.is_famous) && badge(user),
+          el('div', { class: 'badges' },
+            user.is_expert && expertBadge(user),
+            (user.is_featured || user.is_famous) && badge(user)),
           el('h1', null, user.display_name),
           el('p', { class: 'handle' }, '@' + user.username + ' · ' + t('profile.joined', { date: fmtDate(user.created_at) })),
           user.bio && el('p', { class: 'bio' }, user.bio),
@@ -698,7 +818,15 @@
             stat(user.avg_rating != null ? user.avg_rating : '–', t('stat.avgLabel')),
             stat(user.likes_received, t('stat.likesLabel'))),
           mine && !user.is_featured && !user.is_famous && el('p', { class: 'hint' }, t('famous.hint', { n: user.famous_at })),
-          mine && el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: logout }, t('nav.logout')))),
+          el('div', { class: 'profile-actions' },
+            mine && el('a', { class: 'btn btn-ghost btn-sm', href: '#/saved' }, icon('bookmarkO'), t('nav.saved')),
+            mine && el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: logout }, t('nav.logout'))))),
+      (collections.length || mine) && el('section', { class: 'profile-colls' },
+        el('div', { class: 'section-head' }, el('h2', { class: 'profile-h2' }, t('coll.title')),
+          mine && el('button', { class: 'btn btn-primary btn-sm', type: 'button', onClick: () => collectionForm(null, (c) => { location.hash = '#/collection/' + c.id; }) }, icon('plus'), t('coll.new'))),
+        collections.length
+          ? el('div', { class: 'coll-grid' }, collections.map(collectionCard))
+          : el('p', { class: 'hint' }, t('coll.noneMine'))),
       el('h2', { class: 'profile-h2' }, t('profile.reviewsBy', { name: user.display_name })),
       reviews.length
         ? el('div', { class: 'grid' }, reviews.map(reviewCard))
@@ -708,6 +836,320 @@
   }
 
   const stat = (n, label) => el('div', { class: 'stat' }, el('strong', null, String(n)), el('span', null, label));
+
+  /* ------------------------------------------------------------------ */
+  /* Saved, collections, destinations, Experts, ask the community        */
+  /* ------------------------------------------------------------------ */
+  function openSheet(title, ...kids) {
+    const dlg = el('dialog', { class: 'sheet', 'aria-labelledby': 'sheet-title' }, el('h2', { id: 'sheet-title' }, title), ...kids);
+    // close and remove in one go: waiting for the browser's "close" event is not reliable in every browser
+    dlg.dismiss = () => { if (dlg.open) dlg.close(); dlg.remove(); };
+    dlg.addEventListener('close', () => dlg.remove()); // Escape key
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.dismiss(); });
+    document.body.append(dlg);
+    if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '');
+    return dlg;
+  }
+
+  const fieldError = (ex) => errText(ex && ex.code === 'validation' && ex.fields ? Object.values(ex.fields)[0] : ex && ex.code);
+
+  function collectionCard(c) {
+    return el('a', { class: 'coll-card', href: '#/collection/' + c.id },
+      el('div', { class: 'coll-cover' }, c.cover_photo
+        ? el('img', { src: c.cover_photo, alt: '', loading: 'lazy' })
+        : el('span', { 'aria-hidden': 'true' }, c.cover_category ? CAT_ICON[c.cover_category] : '🍽️')),
+      el('div', { class: 'coll-text' },
+        el('strong', null, c.name),
+        el('span', null, t('coll.places', { n: c.item_count })),
+        !c.is_public && el('span', { class: 'lockline' }, icon('lock'), t('coll.private'))));
+  }
+
+  /** Create (existing = null) or edit a collection in a sheet. onDone(collection) runs after saving. */
+  function collectionForm(existing, onDone) {
+    const name = el('input', { class: 'input', id: 'coll-name', type: 'text', maxlength: '60', autocomplete: 'off' });
+    const desc = el('textarea', { class: 'input', id: 'coll-desc', rows: '3', maxlength: '200' });
+    const pub = el('input', { type: 'checkbox', id: 'coll-public' });
+    name.value = existing ? existing.name : '';
+    desc.value = existing ? existing.description : '';
+    pub.checked = existing ? existing.is_public : true;
+    const err = el('p', { class: 'form-err', role: 'alert', hidden: true });
+    const submit = el('button', { class: 'btn btn-primary btn-block', type: 'submit' }, t(existing ? 'f.save' : 'coll.create'));
+    const form = el('form', {
+      class: 'sheet-form', novalidate: true,
+      onSubmit: async (e) => {
+        e.preventDefault();
+        err.hidden = true;
+        submit.disabled = true;
+        try {
+          const body = { name: name.value, description: desc.value, is_public: pub.checked };
+          const res = existing ? await api('PUT', '/api/collections/' + existing.id, body) : await api('POST', '/api/collections', body);
+          dlg.dismiss();
+          toast(t('coll.saved'));
+          onDone(res.collection);
+        } catch (ex) { err.textContent = fieldError(ex); err.hidden = false; }
+        submit.disabled = false;
+      },
+    },
+    err,
+    el('label', { class: 'label', for: 'coll-name' }, t('coll.name')), name,
+    el('label', { class: 'label', for: 'coll-desc' }, t('coll.desc')), desc,
+    el('label', { class: 'check' }, pub, el('span', null, t('coll.public'))),
+    submit);
+    const dlg = openSheet(t(existing ? 'coll.edit' : 'coll.new'), form);
+    name.focus();
+  }
+
+  /** "Add to collection": tap a collection to put the place in (or take it out), or make a new one. */
+  async function openCollectionSheet(r) {
+    if (!state.user) { askLogin('loginToCollect'); return; }
+    const list = el('div', { class: 'coll-list' }, loadingNode());
+    const newName = el('input', { class: 'input', type: 'text', maxlength: '60', autocomplete: 'off', placeholder: t('coll.newPlaceholder'), 'aria-label': t('coll.new') });
+    const err = el('p', { class: 'form-err', role: 'alert', hidden: true });
+    const dlg = openSheet(t('coll.sheetTitle'), list,
+      el('form', {
+        class: 'new-coll',
+        onSubmit: async (e) => {
+          e.preventDefault();
+          err.hidden = true;
+          try {
+            const made = await api('POST', '/api/collections', { name: newName.value, is_public: true });
+            await api('POST', `/api/collections/${made.collection.id}/items`, { review_id: r.id });
+            toast(t('coll.added', { name: made.collection.name }));
+            newName.value = '';
+            await refresh();
+          } catch (ex) { err.textContent = fieldError(ex); err.hidden = false; }
+        },
+      }, err, el('div', { class: 'new-coll-row' }, newName, el('button', { class: 'btn btn-primary', type: 'submit' }, t('coll.createAdd')))),
+      el('button', { class: 'btn btn-ghost btn-block', type: 'button', onClick: () => dlg.dismiss() }, t('coll.done')));
+
+    function row(c) {
+      const btn = el('button', { type: 'button', class: 'coll-row' });
+      const paint = () => {
+        btn.classList.toggle('on', c.has_review);
+        btn.setAttribute('aria-pressed', String(c.has_review));
+        btn.replaceChildren(icon('list'),
+          el('span', { class: 'coll-row-name' }, c.name, !c.is_public && el('span', { class: 'lockline' }, icon('lock'))),
+          el('small', null, t('coll.places', { n: c.item_count })),
+          el('span', { class: 'coll-check' }, c.has_review ? icon('check') : null));
+      };
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          if (c.has_review) {
+            c.item_count = (await api('DELETE', `/api/collections/${c.id}/items/${r.id}`)).item_count;
+            c.has_review = false;
+            toast(t('coll.removed', { name: c.name }));
+          } else {
+            c.item_count = (await api('POST', `/api/collections/${c.id}/items`, { review_id: r.id })).item_count;
+            c.has_review = true;
+            toast(t('coll.added', { name: c.name }));
+          }
+          paint();
+        } catch (ex) { toast(fieldError(ex)); }
+        btn.disabled = false;
+      });
+      paint();
+      return btn;
+    }
+
+    async function refresh() {
+      try {
+        const { collections } = await api('GET', `/api/me/collections?review_id=${r.id}`);
+        list.replaceChildren(...(collections.length ? collections.map(row) : [el('p', { class: 'hint' }, t('coll.sheetEmpty'))]));
+      } catch (ex) { list.replaceChildren(el('p', { class: 'form-err' }, errText(ex.code))); }
+    }
+    refresh();
+  }
+
+  async function viewSaved() {
+    if (!state.user) { askLogin('err.unauthorized'); return el('div'); }
+    setTitle(t('saved.title'));
+    const { reviews } = await api('GET', '/api/saved?limit=50');
+    let left = reviews.length;
+    const count = el('p', { class: 'count' }, t('resultCount', { n: left }));
+    const empty = () => el('div', { class: 'empty' }, el('div', { class: 'message-emoji', 'aria-hidden': 'true' }, '🔖'),
+      el('h3', null, t('saved.empty.title')), el('p', null, t('saved.empty.sub')), el('a', { class: 'btn btn-primary', href: '#/' }, t('nav.home')));
+    const grid = el('div', { class: 'grid' });
+    reviews.forEach((r) => {
+      const card = reviewCard(r, {
+        onSaveChange: (saved) => {
+          if (saved) return;
+          card.remove(); // un-saving takes it off this list straight away
+          count.textContent = t('resultCount', { n: --left });
+          if (!left) grid.replaceChildren(empty());
+        },
+      });
+      grid.append(card);
+    });
+    if (!left) grid.append(empty());
+    return el('div', { class: 'wrap section' },
+      el('div', { class: 'section-head' }, el('h1', { class: 'page-h1' }, '🔖 ' + t('saved.title')), count),
+      el('p', { class: 'sub page-sub' }, t('saved.sub')), grid);
+  }
+
+  async function viewCollection(id) {
+    const { collection: c, reviews, mine } = await api('GET', '/api/collections/' + id);
+    setTitle(c.name);
+    let left = reviews.length;
+    const places = el('span', null, t('coll.places', { n: left }));
+    const grid = el('div', { class: 'grid' });
+    const emptyNote = () => el('div', { class: 'empty' }, el('div', { class: 'message-emoji', 'aria-hidden': 'true' }, '🍽️'), el('p', null, t('coll.empty')));
+    reviews.forEach((r) => {
+      const card = reviewCard(r, {
+        extra: mine && el('button', {
+          class: 'btn btn-ghost btn-sm card-remove', type: 'button',
+          onClick: async () => {
+            try {
+              await api('DELETE', `/api/collections/${c.id}/items/${r.id}`);
+              card.remove();
+              places.textContent = t('coll.places', { n: --left });
+              if (!left) grid.replaceChildren(emptyNote());
+              toast(t('coll.removed', { name: c.name }));
+            } catch (ex) { handleErr(ex); }
+          },
+        }, icon('trash'), t('coll.remove')),
+      });
+      grid.append(card);
+    });
+    if (!left) grid.append(emptyNote());
+    return el('div', { class: 'wrap section' },
+      el('a', { class: 'back', href: '#/user/' + encodeURIComponent(c.owner.username) }, '← ' + t('coll.by', { name: c.owner.display_name })),
+      el('div', { class: 'coll-head' },
+        el('h1', { class: 'page-h1' }, c.name),
+        c.description && el('p', { class: 'bio' }, c.description),
+        el('div', { class: 'coll-meta' }, authorChip(c.owner), places, !c.is_public && el('span', { class: 'lockline' }, icon('lock'), t('coll.private'))),
+        el('div', { class: 'detail-actions' },
+          c.is_public && el('button', {
+            class: 'btn btn-ghost btn-sm', type: 'button',
+            onClick: async () => { try { await navigator.clipboard.writeText(location.href); toast(t('copied')); } catch (e) { toast(location.href); } },
+          }, icon('link'), t('coll.share')),
+          mine && el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: () => collectionForm(c, () => render()) }, icon('pencil'), t('coll.edit')),
+          mine && el('button', {
+            class: 'btn btn-danger btn-sm', type: 'button',
+            onClick: async () => {
+              if (!confirm(t('coll.confirmDelete'))) return;
+              try { await api('DELETE', '/api/collections/' + c.id); toast(t('coll.deleted')); location.hash = '#/user/' + encodeURIComponent(c.owner.username); } catch (ex) { handleErr(ex); }
+            },
+          }, icon('trash'), t('coll.delete')))),
+      grid);
+  }
+
+  async function viewCities() {
+    setTitle(t('cities.title'));
+    const { cities } = await api('GET', '/api/cities');
+    return el('div', { class: 'wrap section' },
+      el('h1', { class: 'page-h1' }, '📍 ' + t('cities.title')),
+      el('p', { class: 'sub page-sub' }, t('cities.sub')),
+      cities.length ? el('div', { class: 'dest-grid' }, cities.map(destinationCard)) : el('p', null, t('empty.title')));
+  }
+
+  async function viewCity(slug) {
+    if (!CITIES.includes(slug)) return errorBox({ code: 'not_found' });
+    setTitle(cityName(slug));
+    const { cities } = await api('GET', '/api/cities');
+    const n = (cities.find((c) => c.city === slug) || {}).count || 0;
+    const feed = feedSection({
+      filters: { q: '', category: '', city: slug, expert: false, payment: '', min_rating: '', sort: 'new' },
+      fixedCity: true,
+      title: t('city.reviewsIn', { city: cityName(slug) }),
+    });
+    const node = el('div', null,
+      el('section', { class: 'city-hero' }, el('div', { class: 'wrap city-hero-in' },
+        el('a', { class: 'back light', href: '#/cities' }, '← ' + t('cities.title')),
+        el('h1', null, '📍 ' + cityName(slug)),
+        el('p', { class: 'lead' }, t('city.places', { n })),
+        slug !== 'other' && el('a', { class: 'btn btn-cream', href: '#/ask?q=' + encodeURIComponent(t('ask.cityQuestion', { city: cityName(slug) })) }, icon('ask'), t('city.ask', { city: cityName(slug) })))),
+      feed.node);
+    feed.load(true);
+    return node;
+  }
+
+  async function viewExperts() {
+    setTitle(t('experts.title'));
+    const { experts } = await api('GET', '/api/experts');
+    return el('div', { class: 'wrap section' },
+      el('h1', { class: 'page-h1' }, el('span', { class: 'ic title-ic', html: ICON.chef }), t('experts.title')),
+      el('p', { class: 'sub page-sub' }, t('experts.sub')),
+      el('div', { class: 'note' }, el('strong', null, t('experts.whatTitle')), ' ', t('experts.what')),
+      experts.length
+        ? el('div', { class: 'famous-grid' }, experts.map((u) => el('a', { class: 'famous-card', href: '#/user/' + encodeURIComponent(u.username) },
+          avatar(u, 'md'),
+          el('div', { class: 'famous-text' },
+            expertBadge(u),
+            el('h3', null, u.display_name),
+            el('p', { class: 'stats-line' }, t('famous.stats', { reviews: u.review_count, likes: u.likes_received }),
+              u.avg_rating != null ? ' · ' + t('stat.avg', { n: u.avg_rating }) : '')))))
+        : el('p', null, t('experts.empty')));
+  }
+
+  /** Ask the community: plain-language questions answered only from the reviews on this site. */
+  async function viewAsk() {
+    setTitle(t('ask.title'));
+    const params = new URLSearchParams(location.hash.split('?')[1] || '');
+    const input = el('input', { class: 'input', id: 'ask-q', type: 'search', maxlength: '200', autocomplete: 'off', placeholder: t('ask.placeholder'), 'aria-label': t('ask.title') });
+    const out = el('div', { class: 'ask-out', 'aria-live': 'polite' });
+
+    const interpretation = (found) => {
+      const chips = [];
+      if (found.category) chips.push(`${CAT_ICON[found.category]} ${t('cat.' + found.category)}`);
+      if (found.city) chips.push(`📍 ${cityName(found.city)}`);
+      if (found.payment) chips.push(`${PAY_ICON[found.payment]} ${t('pay.' + found.payment)}`);
+      if (found.max_price) chips.push(`≤ ${baht(found.max_price)}`);
+      if (found.spice) chips.push(`🌶️ ${t(found.spice === 'hot' ? 'ask.i.hot' : 'ask.i.mild')}`);
+      if (found.late) chips.push(`🌙 ${t('ask.i.late')}`);
+      if (found.morning) chips.push(`🌅 ${t('ask.i.morning')}`);
+      if (found.expert) chips.push(`👨‍🍳 ${t('ask.i.expert')}`);
+      if (found.words && found.words.length) chips.push(`“${found.words.join(' ')}”`);
+      return chips.length ? el('p', { class: 'ask-looked' }, t('ask.looked'), ' ', chips.map((c) => el('span', { class: 'tag tag-cat' }, c))) : null;
+    };
+
+    // DOM replaceChildren turns false/null into the words "false"/"null": leave empty values out
+    const show = (...kids) => out.replaceChildren(...kids.filter(Boolean));
+
+    async function ask(text) {
+      text = text.trim();
+      if (!text) return;
+      input.value = text;
+      out.replaceChildren(loadingNode());
+      try {
+        const res = await api('GET', '/api/ask?q=' + encodeURIComponent(text));
+        if (res.found) {
+          show(
+            interpretation(res.interpretation),
+            res.loosened && el('p', { class: 'note' }, t('ask.loosened')),
+            el('h2', { class: 'ask-h' }, t('ask.found')),
+            el('div', { class: 'grid' }, res.results.map((r) => reviewCard(r, {
+              extra: el('p', { class: 'ask-why' }, icon(r.author.is_expert ? 'chef' : 'user'),
+                r.author.is_expert ? t('ask.expertTip', { name: r.author.display_name }) : t('ask.by', { name: r.author.display_name }),
+                ' · ', t('ask.likes', { n: r.likes })),
+            }))));
+        } else {
+          const sugg = res.suggestions || { cities: [], categories: [] };
+          show(
+            interpretation(res.interpretation),
+            el('div', { class: 'empty' },
+              el('div', { class: 'message-emoji', 'aria-hidden': 'true' }, '🤔'),
+              el('h3', null, t('ask.none.title')), el('p', null, t('ask.none.sub')),
+              el('div', { class: 'chips' },
+                sugg.cities.map((c) => el('button', { type: 'button', class: 'chip', onClick: () => ask(t('ask.cityQuestion', { city: cityName(c) })) }, '📍 ' + cityName(c))),
+                sugg.categories.map((c) => el('button', { type: 'button', class: 'chip', onClick: () => ask(t('cat.' + c)) }, `${CAT_ICON[c]} ${t('cat.' + c)}`))),
+              el('a', { class: 'btn btn-primary', href: '#/new' }, icon('plus'), t('nav.write'))));
+        }
+      } catch (e) { out.replaceChildren(errorBox(e, () => ask(text))); }
+    }
+
+    const examples = [t('ask.ex1'), t('ask.ex2'), t('ask.ex3'), t('ask.ex4')];
+    const node = el('div', { class: 'wrap section ask' },
+      el('h1', { class: 'page-h1' }, el('span', { class: 'ic title-ic', html: ICON.ask }), t('ask.title')),
+      el('p', { class: 'sub page-sub' }, t('ask.sub')),
+      el('form', { class: 'ask-form', role: 'search', onSubmit: (e) => { e.preventDefault(); ask(input.value); } },
+        el('div', { class: 'search' }, icon('search'), input), el('button', { class: 'btn btn-primary', type: 'submit' }, t('ask.button'))),
+      el('div', { class: 'chips ask-examples' }, el('span', { class: 'hint' }, t('ask.try')),
+        examples.map((ex) => el('button', { type: 'button', class: 'chip chip-sm', onClick: () => ask(ex) }, ex))),
+      out);
+    if (params.get('q')) ask(params.get('q'));
+    return node;
+  }
 
   /* ------------------------------------------------------------------ */
   /* Auth                                                                */
@@ -838,12 +1280,12 @@
     const f = editing
       ? {
         restaurant_name: editing.restaurant_name, area: editing.area, menu_item: editing.menu_item, rating: editing.rating,
-        category: editing.category || 'other', catTouched: true, price_thb: String(editing.price_thb), spice: editing.spice, payments: [...editing.payments], open_days: [...editing.open_days],
+        city: editing.city || 'other', cityTouched: true, category: editing.category || 'other', catTouched: true, price_thb: String(editing.price_thb), spice: editing.spice, payments: [...editing.payments], open_days: [...editing.open_days],
         open_time: editing.open_time, close_time: editing.close_time, body: editing.body,
         photo: editing.photo ? editing.photo.split('/').pop() : null, photoUrl: editing.photo, photoBlob: null,
       }
       : {
-        restaurant_name: '', area: '', menu_item: '', rating: 0, category: 'other', catTouched: false, price_thb: '', spice: 0, payments: [], open_days: [],
+        restaurant_name: '', area: '', menu_item: '', rating: 0, city: 'other', cityTouched: false, category: 'other', catTouched: false, price_thb: '', spice: 0, payments: [], open_days: [],
         open_time: '', close_time: '', body: '', photo: null, photoUrl: null, photoBlob: null,
       };
 
@@ -885,7 +1327,7 @@
       if (!hit) return;
       autofilledFor = key;
       let used = false;
-      if (!f.area && hit.area) { f.area = hit.area; inputs.area.value = hit.area; used = true; }
+      if (!f.area && hit.area) { f.area = hit.area; inputs.area.value = hit.area; suggestCity(); used = true; }
       if (!f.payments.length) { f.payments = [...hit.payments]; groups.payments.paint(); used = true; }
       if (!f.open_days.length) { f.open_days = [...hit.open_days]; groups.days.paint(); used = true; }
       if (!f.open_time && !f.close_time) {
@@ -920,6 +1362,16 @@
       type: 'button', class: 'chip chip-sm', onClick: () => { f.price_thb = String(n); inputs.price_thb.value = String(n); clearErr('price_thb'); },
     }, baht(n))));
     const priceInput = text('price_thb', { max: 5, digits: true, inputmode: 'numeric', placeholder: '60' });
+
+    /* --- city (auto-guessed from the area until the poster picks one) --- */
+    const citySelect = el('select', { class: 'input', id: 'in-city', name: 'city' }, CITIES.map((c) => el('option', { value: c }, cityName(c))));
+    citySelect.value = f.city;
+    citySelect.addEventListener('change', () => { f.city = citySelect.value; f.cityTouched = true; clearErr('city'); });
+    function suggestCity() {
+      if (f.cityTouched) return;
+      f.city = guessCity(`${f.area} ${f.restaurant_name}`);
+      citySelect.value = f.city;
+    }
 
     /* --- category (auto-guessed from the menu name until the poster picks one) --- */
     groups.category = chipGroup(CATS.map((k) => ({ key: k, icon: CAT_ICON[k], label: t('cat.' + k) })),
@@ -1018,7 +1470,8 @@
       el('div', { class: 'form-head' }, el('h1', null, t(editing ? 'form.editTitle' : 'form.newTitle')), el('p', { class: 'sub' }, t('form.sub'))),
       panel(1, t('form.s1'),
         field('restaurant_name', t('f.restaurant'), text('restaurant_name', { max: 80, list: 'dl-restaurants', placeholder: t('f.restaurantPh'), onInput: maybeAutofill, onChange: maybeAutofill }), { required: true, hint: editing ? null : t('f.restaurantHint') }),
-        field('area', t('f.area'), text('area', { max: 80, placeholder: t('f.areaPh') }), { optional: true })),
+        field('area', t('f.area'), text('area', { max: 80, placeholder: t('f.areaPh'), onInput: suggestCity, onChange: suggestCity }), { optional: true }),
+        field('city', t('f.city'), citySelect, { required: true, hint: t('f.cityHint') })),
       panel(2, t('form.s2'),
         field('menu_item', t('f.menu'), text('menu_item', { max: 80, list: 'dl-dishes', placeholder: t('f.menuPh'), onInput: suggestCategory, onChange: suggestCategory }), { required: true }),
         field('category', t('f.category'), groups.category.node, { required: true, group: true, hint: t('f.categoryHint') }),
@@ -1071,7 +1524,7 @@
     }
 
     async function submit() {
-      Object.keys({ restaurant_name: 1, area: 1, menu_item: 1, category: 1, price_thb: 1, rating: 1, spice: 1, photo: 1, body: 1, payments: 1, open_days: 1, open_time: 1, close_time: 1 })
+      Object.keys({ restaurant_name: 1, area: 1, city: 1, menu_item: 1, category: 1, price_thb: 1, rating: 1, spice: 1, photo: 1, body: 1, payments: 1, open_days: 1, open_time: 1, close_time: 1 })
         .forEach((n) => setFieldError(form, n, null));
       const errs = validate();
       if (Object.keys(errs).length) { showErrors(errs); toast(t('f.fixErrors')); return; }
@@ -1083,7 +1536,7 @@
           f.photo = up.photo; f.photoBlob = null;
         }
         const payload = {
-          restaurant_name: f.restaurant_name, area: f.area, menu_item: f.menu_item, category: f.category, rating: f.rating,
+          restaurant_name: f.restaurant_name, area: f.area, city: f.city, menu_item: f.menu_item, category: f.category, rating: f.rating,
           price_thb: Number(f.price_thb), spice: f.spice, payments: f.payments, open_days: f.open_days,
           open_time: f.open_time, close_time: f.close_time, body: f.body, photo: f.photo,
         };
@@ -1113,6 +1566,12 @@
     [/^\/new$/, () => viewForm(null)],
     [/^\/edit\/(\d+)$/, (id) => viewForm(id)],
     [/^\/user\/([A-Za-z0-9_]+)$/, viewUser],
+    [/^\/saved$/, viewSaved],
+    [/^\/collection\/(\d+)$/, viewCollection],
+    [/^\/cities$/, viewCities],
+    [/^\/city\/([a-z_]+)$/, viewCity],
+    [/^\/experts$/, viewExperts],
+    [/^\/ask$/, viewAsk],
     [/^\/login$/, () => authView('login')],
     [/^\/signup$/, () => authView('signup')],
   ];
@@ -1125,6 +1584,7 @@
     const path = (location.hash.replace(/^#/, '') || '/').split('?')[0];
     document.body.dataset.route = /^\/(new|edit)/.test(path) ? 'form' : /^\/(login|signup)$/.test(path) ? 'auth' : 'page';
     renderTabbar();
+    renderNav();
     renderInstall();
     main.replaceChildren(loadingNode());
     let node;

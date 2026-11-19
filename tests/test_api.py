@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from http.cookies import SimpleCookie
 from pathlib import Path
 from wsgiref.simple_server import WSGIRequestHandler, make_server as make_wsgi_server
@@ -343,6 +344,237 @@ class AppTest(unittest.TestCase):
         self.assertIn("test_blogger", famous)
         self.assertFalse([u for u in famous if u.startswith("demo_")])  # the extra foodies stay ordinary
 
+    # ---- saved places ------------------------------------------------------
+    def test_save_for_later_is_private_and_toggles(self):
+        c = self.signup("sam_save")
+        first = self.client().request("GET", "/api/reviews?limit=2&sort=top")[1]["reviews"]
+        a, b = first[0]["id"], first[1]["id"]
+        self.assertEqual(self.client().request("POST", f"/api/reviews/{a}/save")[0], 401)
+        self.assertEqual(c.request("GET", "/api/saved")[1], {"reviews": [], "total": 0})
+        self.assertEqual(c.request("POST", f"/api/reviews/{a}/save")[1], {"saved": True})
+        self.assertEqual(c.request("POST", f"/api/reviews/{b}/save")[1], {"saved": True})
+        self.assertTrue(c.request("GET", f"/api/reviews/{a}")[1]["review"]["saved"])
+        self.assertFalse(self.client().request("GET", f"/api/reviews/{a}")[1]["review"]["saved"])  # a visitor sees nothing
+        status, body, _ = c.request("GET", "/api/saved")
+        self.assertEqual((body["total"], [r["id"] for r in body["reviews"]]), (2, [b, a]))  # newest save first
+        self.assertTrue(all(r["saved"] for r in body["reviews"]))
+        self.assertEqual(c.request("POST", f"/api/reviews/{a}/save")[1], {"saved": False})  # second tap removes it
+        self.assertEqual(c.request("GET", "/api/saved")[1]["total"], 1)
+        self.assertEqual(c.request("POST", "/api/reviews/999999/save")[0], 404)
+        self.assertEqual(self.signup("sam_other").request("GET", "/api/saved")[1]["total"], 0)  # nobody else sees my list
+
+    # ---- collections -------------------------------------------------------
+    def test_collection_lifecycle_and_privacy(self):
+        owner, other, anon = self.signup("cora_coll"), self.signup("otto_coll"), self.client()
+        ids = [r["id"] for r in anon.request("GET", "/api/reviews?limit=3&sort=top")[1]["reviews"]]
+        self.assertEqual(anon.request("POST", "/api/collections", {"name": "Nope"})[0], 401)
+        status, body, _ = owner.request("POST", "/api/collections", {"name": "  Rainy day   soups ", "description": "Warm bowls", "is_public": True})
+        self.assertEqual(status, 201, body)
+        coll = body["collection"]
+        self.assertEqual((coll["name"], coll["item_count"], coll["owner"]["username"]), ("Rainy day soups", 0, "cora_coll"))
+        cid = coll["id"]
+        # validation: name rules and one collection per name
+        for bad, code in (({"name": ""}, "required"), ({"name": "x"}, "too_short"), ({"name": "y" * 61}, "too_long")):
+            status, body, _ = owner.request("POST", "/api/collections", bad)
+            self.assertEqual((status, body["fields"]["name"]), (400, code))
+        self.assertEqual(owner.request("POST", "/api/collections", {"name": "RAINY DAY SOUPS"})[1]["fields"]["name"], "name_taken")
+        self.assertEqual(other.request("POST", "/api/collections", {"name": "Rainy day soups"})[0], 201)  # names are per person
+        self.assertEqual(owner.request("POST", "/api/collections", {"name": "fine", "is_public": "maybe"})[1]["fields"]["is_public"], "invalid")
+        # adding and removing places
+        self.assertEqual(anon.request("POST", f"/api/collections/{cid}/items", {"review_id": ids[0]})[0], 401)
+        self.assertEqual(other.request("POST", f"/api/collections/{cid}/items", {"review_id": ids[0]})[0], 403)  # not their collection
+        status, body, _ = owner.request("POST", f"/api/collections/{cid}/items", {"review_id": ids[0]})
+        self.assertEqual((status, body), (201, {"added": True, "item_count": 1}))
+        status, body, _ = owner.request("POST", f"/api/collections/{cid}/items", {"review_id": ids[0]})
+        self.assertEqual((status, body), (200, {"added": False, "item_count": 1}))  # already in there
+        owner.request("POST", f"/api/collections/{cid}/items", {"review_id": ids[1]})
+        self.assertEqual(owner.request("POST", f"/api/collections/{cid}/items", {"review_id": 999999})[0], 404)
+        self.assertEqual(owner.request("POST", f"/api/collections/{cid}/items", {"review_id": "x"})[0], 404)
+        # a public collection is readable by anyone, with its reviews (newest addition first)
+        status, body, _ = anon.request("GET", f"/api/collections/{cid}")
+        self.assertEqual((status, body["mine"], [r["id"] for r in body["reviews"]]), (200, False, [ids[1], ids[0]]))
+        self.assertEqual(owner.request("GET", f"/api/collections/{cid}")[1]["mine"], True)
+        # my collections, with the ones that already hold a given place marked
+        mine = owner.request("GET", f"/api/me/collections?review_id={ids[0]}")[1]["collections"]
+        self.assertEqual([(c["name"], c["has_review"]) for c in mine], [("Rainy day soups", True)])
+        self.assertFalse(owner.request("GET", f"/api/me/collections?review_id={ids[2]}")[1]["collections"][0]["has_review"])
+        self.assertEqual(anon.request("GET", "/api/me/collections")[0], 401)
+        # making it private hides it from everybody but the owner
+        status, body, _ = owner.request("PUT", f"/api/collections/{cid}", {"name": "Rainy day soups", "is_public": False})
+        self.assertEqual((status, body["collection"]["is_public"]), (200, False))
+        self.assertEqual(other.request("PUT", f"/api/collections/{cid}", {"name": "Hijacked"})[0], 403)
+        self.assertEqual(anon.request("GET", f"/api/collections/{cid}")[0], 404)
+        self.assertEqual(other.request("GET", f"/api/collections/{cid}")[0], 404)
+        self.assertEqual(owner.request("GET", f"/api/collections/{cid}")[0], 200)
+        self.assertEqual(anon.request("GET", "/api/users/cora_coll/collections")[1], {"collections": [], "mine": False})
+        self.assertEqual(len(owner.request("GET", "/api/users/cora_coll/collections")[1]["collections"]), 1)
+        # removing a place, then the whole collection
+        status, body, _ = owner.request("DELETE", f"/api/collections/{cid}/items/{ids[0]}")
+        self.assertEqual((status, body), (200, {"removed": True, "item_count": 1}))
+        self.assertEqual(other.request("DELETE", f"/api/collections/{cid}")[0], 403)
+        self.assertEqual(owner.request("DELETE", f"/api/collections/{cid}")[0], 200)
+        self.assertEqual(owner.request("GET", f"/api/collections/{cid}")[0], 404)
+        self.assertEqual(anon.request("GET", f"/api/reviews/{ids[0]}")[0], 200)  # the reviews themselves are untouched
+
+    def test_deleting_a_review_removes_it_from_saves_and_collections(self):
+        author, fan = self.signup("dee_author"), self.signup("fin_fan")
+        rid = author.request("POST", "/api/reviews", GOOD_REVIEW)[1]["review"]["id"]
+        cid = fan.request("POST", "/api/collections", {"name": "Keepers"})[1]["collection"]["id"]
+        fan.request("POST", f"/api/collections/{cid}/items", {"review_id": rid})
+        fan.request("POST", f"/api/reviews/{rid}/save")
+        self.assertEqual(fan.request("GET", "/api/saved")[1]["total"], 1)
+        author.request("DELETE", f"/api/reviews/{rid}")
+        self.assertEqual(fan.request("GET", "/api/saved")[1]["total"], 0)
+        self.assertEqual(fan.request("GET", f"/api/collections/{cid}")[1]["collection"]["item_count"], 0)
+
+    def test_sample_collections_exist_and_are_filled(self):
+        anon = self.client()
+        names = {c["name"]: c for c in anon.request("GET", "/api/users/claude/collections")[1]["collections"]}
+        self.assertEqual(set(names), {"Noodle crawl", "Cash-only classics", "Late-night bites"})
+        self.assertGreaterEqual(names["Noodle crawl"]["item_count"], 5)
+        self.assertGreaterEqual(names["Late-night bites"]["item_count"], 2)
+        body = anon.request("GET", f"/api/collections/{names['Noodle crawl']['id']}")[1]
+        self.assertTrue(all(r["category"] == "noodles" for r in body["reviews"]))
+        self.assertEqual([c["name"] for c in anon.request("GET", "/api/users/test_blogger/collections")[1]["collections"]], ["Basil lovers"])
+
+    # ---- cities --------------------------------------------------------------
+    def test_cities_filter_and_are_guessed_from_the_area(self):
+        c = self.signup("cam_city")
+        cities = {x["city"]: x["count"] for x in c.request("GET", "/api/cities")[1]["cities"]}
+        self.assertGreaterEqual(cities["bangkok"], 10)
+        self.assertEqual(c.request("GET", "/api/cities")[1]["cities"][0]["city"], "bangkok")  # busiest first
+        for city in ("chiang_mai", "phuket", "hat_yai", "ayutthaya", "khon_kaen", "chonburi"):
+            self.assertGreaterEqual(cities.get(city, 0), 1, city)
+        body = c.request("GET", "/api/reviews?city=chiang_mai&limit=50")[1]
+        self.assertEqual(body["total"], cities["chiang_mai"])
+        self.assertTrue(body["reviews"] and all(r["city"] == "chiang_mai" for r in body["reviews"]))
+        self.assertEqual(c.request("GET", "/api/reviews?city=atlantis")[1]["total"], c.request("GET", "/api/reviews")[1]["total"])  # unknown: ignored
+        # a new review: city guessed from the area when left out, kept when given, rejected when unknown
+        no_city = {k: v for k, v in GOOD_REVIEW.items() if k != "city"}
+        self.assertEqual(c.request("POST", "/api/reviews", dict(no_city, area="Nimman, Chiang Mai"))[1]["review"]["city"], "chiang_mai")
+        self.assertEqual(c.request("POST", "/api/reviews", dict(no_city, area="Somewhere new"))[1]["review"]["city"], "other")
+        self.assertEqual(c.request("POST", "/api/reviews", dict(no_city, area="Hat Yai", city="krabi"))[1]["review"]["city"], "krabi")
+        status, body, _ = c.request("POST", "/api/reviews", dict(no_city, city="atlantis"))
+        self.assertEqual((status, body["fields"]["city"]), (400, "invalid"))
+        self.assertEqual(server.guess_city("ถนนนิมมาน เชียงใหม่"), "chiang_mai")
+
+    # ---- experts -------------------------------------------------------------
+    def test_experts_are_labelled_and_filterable(self):
+        anon = self.client()
+        experts = {e["username"]: e for e in anon.request("GET", "/api/experts")[1]["experts"]}
+        self.assertEqual({"claude", "demo_ton", "demo_nok"} <= set(experts), True)
+        self.assertEqual((experts["claude"]["expert_title"], experts["claude"]["review_count"]), ("Food blogger", 8))
+        self.assertTrue(all(e["is_expert"] for e in experts.values()))
+        self.assertFalse(anon.request("GET", "/api/users/test_blogger")[1]["user"]["is_expert"])  # famous, but not an Expert
+        reviews = anon.request("GET", "/api/reviews?expert=1&limit=50")[1]
+        self.assertTrue(reviews["reviews"] and all(r["author"]["is_expert"] for r in reviews["reviews"]))
+        self.assertLess(reviews["total"], anon.request("GET", "/api/reviews")[1]["total"])
+        one = anon.request("GET", "/api/reviews?user=demo_ton")[1]["reviews"][0]["author"]
+        self.assertEqual((one["is_expert"], one["expert_title"]), (True, "Street food chef"))
+        fresh = self.signup("newbie_member")
+        self.assertFalse(fresh.request("GET", "/api/me")[1]["user"]["is_expert"])  # nobody can award it to themselves
+
+    def test_set_expert_command_gives_and_takes_the_badge(self):
+        self.signup("eve_expert")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(server.set_expert("EVE_EXPERT", "  Noodle   critic ", True), 0)
+        self.assertIn("Noodle critic", out.getvalue())
+        user = self.client().request("GET", "/api/users/eve_expert")[1]["user"]
+        self.assertEqual((user["is_expert"], user["expert_title"]), (True, "Noodle critic"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(server.set_expert("eve_expert", "", False), 0)
+        user = self.client().request("GET", "/api/users/eve_expert")[1]["user"]
+        self.assertEqual((user["is_expert"], user["expert_title"]), (False, ""))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(server.set_expert("nobody_here", "x", True), 1)
+
+    # ---- ask the community ---------------------------------------------------
+    def ask(self, text, client=None):
+        status, body, _ = (client or self.client()).request("GET", "/api/ask?q=" + urllib.parse.quote(text))
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_ask_understands_city_and_category(self):
+        body = self.ask("best noodles in Chiang Mai")
+        self.assertTrue(body["found"])
+        self.assertEqual((body["interpretation"]["city"], body["interpretation"]["category"]), ("chiang_mai", "noodles"))
+        self.assertTrue(body["results"] and all((r["city"], r["category"]) == ("chiang_mai", "noodles") for r in body["results"]))
+        thai = self.ask("ก๋วยเตี๋ยวเชียงใหม่")
+        self.assertEqual((thai["interpretation"]["city"], thai["interpretation"]["category"]), ("chiang_mai", "noodles"))
+        self.assertTrue(thai["found"])
+
+    def test_ask_understands_price_payment_spice_and_time(self):
+        body = self.ask("cheap cash only khao man gai")
+        self.assertEqual(body["interpretation"], {"category": "khao_man_gai", "payment": "cash_only", "max_price": 60})
+        self.assertTrue(body["found"] and all(r["price_thb"] <= 60 and "cash_only" in r["payments"] for r in body["results"]))
+        body = self.ask("spicy kra pao in bangkok under 100 baht")
+        self.assertEqual((body["interpretation"]["spice"], body["interpretation"]["max_price"]), ("hot", 100))
+        self.assertTrue(body["found"] and all(r["spice"] >= 2 and r["price_thb"] <= 100 and r["city"] == "bangkok" for r in body["results"]))
+        self.assertTrue(self.ask("not spicy noodles")["found"])
+        self.assertTrue(all(r["spice"] <= 1 for r in self.ask("not spicy noodles")["results"]))
+        late = self.ask("late night food")
+        self.assertTrue(late["found"] and all(r["close_time"] < r["open_time"] or r["close_time"] >= "22:00" for r in late["results"]))
+        early = self.ask("breakfast")
+        self.assertTrue(early["found"] and all(r["open_time"] <= "08:00" for r in early["results"]))
+        self.assertTrue(self.ask("pay with QR code")["found"])
+
+    def test_every_example_question_on_the_ask_page_gets_a_real_answer(self):
+        i18n = (Path(__file__).resolve().parent.parent / "public" / "js" / "i18n.js").read_text(encoding="utf-8")
+        english, thai = i18n.split("\n  th: {")
+        for block, name in ((english, "English"), (thai, "Thai")):
+            examples = re.findall(r'"ask\.ex\d": "([^"]+)"', block)
+            self.assertEqual(len(examples), 4, name)
+            for question in examples:
+                body = self.ask(question)
+                self.assertTrue(body["found"] and not body["loosened"], f"{name}: {question!r} -> {body['interpretation']}")
+        for city in server.CITIES[:-1]:  # the "Ask about <city>" button on every city page
+            english_name = re.search(rf'"city\.{city}": "([^"]+)"', english).group(1)
+            thai_name = re.search(rf'"city\.{city}": "([^"]+)"', thai).group(1)
+            for question in (f"best street food in {english_name}", f"ร้านเด็ดใน{thai_name}"):
+                self.assertEqual(self.ask(question)["interpretation"].get("city"), city, question)
+
+    def test_thai_questions_drop_filler_words_instead_of_searching_for_them(self):
+        found = server.interpret_question("ข้าวมันไก่เงินสด ราคาถูก")
+        self.assertEqual((found["category"], found["payment"], found["max_price"], found["words"]), ("khao_man_gai", "cash_only", 60, []))
+        found = server.interpret_question("ร้านเปิดดึกจากผู้เชี่ยวชาญ")
+        self.assertEqual((found["late"], found["expert"], found["words"]), (True, True, []))
+        self.assertEqual(server.interpret_question("หมูปิ้งภูเก็ตอร่อย")["words"], ["หมูปิ้ง"])  # a real dish name is kept
+        self.assertEqual(server.interpret_question("ข้าวขาหมู")["words"], ["ขาหมู"])  # only the word for rice is dropped
+        self.assertEqual(server.interpret_question("best street food in Koh Samui")["words"], [])
+
+    def test_ask_puts_experts_first_and_can_ask_for_experts_only(self):
+        body = self.ask("spicy kra pao in bangkok")
+        self.assertTrue(body["results"][0]["author"]["is_expert"])  # an Expert's tip leads
+        only = self.ask("noodles recommended by experts")
+        self.assertTrue(only["found"] and all(r["author"]["is_expert"] for r in only["results"]))
+        self.assertLessEqual(len(self.ask("noodles")["results"]), 5)
+
+    def test_ask_uses_other_words_and_loosens_honestly(self):
+        moo = self.ask("anything good with moo ping in phuket")
+        self.assertTrue(moo["found"] and not moo["loosened"])
+        self.assertIn("Moo Ping", moo["results"][0]["menu_item"])
+        loose = self.ask("noodles in Chiang Mai with unicorn sauce")
+        self.assertTrue(loose["found"] and loose["loosened"])  # nothing matched "unicorn", the clear filters still do
+
+    def test_ask_says_when_it_does_not_know(self):
+        body = self.ask("qzxv plugh frobnicate")
+        self.assertFalse(body["found"])
+        self.assertEqual(body["results"], [])
+        self.assertIn("bangkok", body["suggestions"]["cities"])
+        self.assertIn("noodles", body["suggestions"]["categories"])
+        self.assertFalse(self.ask("noodles in krabi")["found"])  # a real city we have no noodle tip for: no invented answer
+
+    def test_ask_input_limits_and_rate_limit(self):
+        c = self.client()
+        self.assertEqual(c.request("GET", "/api/ask")[1]["fields"]["q"], "required")
+        self.assertEqual(c.request("GET", "/api/ask?q=%20%20")[0], 400)
+        self.assertEqual(c.request("GET", "/api/ask?q=" + "x" * 201)[1]["fields"]["q"], "too_long")
+        self.assertEqual(self.ask("o'brien \"noodles\" %_ \\ ; --")["found"], True)  # odd characters are just text, never SQL
+        for _ in range(60):
+            c.request("GET", "/api/ask?q=noodles")
+        self.assertEqual(c.request("GET", "/api/ask?q=noodles")[0], 429)
+
     def test_seed_is_not_repeated(self):
         con = server.connect()
         try:
@@ -648,7 +880,7 @@ class PostgresAppTest(AppTest):
         server.use_postgres(os.environ["RUBRUB_TEST_DATABASE_URL"])
         con = server.connect()
         try:
-            con.execute("DROP TABLE IF EXISTS likes, photos, rate_hits, sessions, reviews, users, meta CASCADE")
+            con.execute("DROP TABLE IF EXISTS " + ", ".join(db.TABLE_NAMES) + " CASCADE")
             con.commit()
         finally:
             con.close()
@@ -673,6 +905,45 @@ class PostgresAppTest(AppTest):
             con.close()
 
 
+@unittest.skipUnless(os.environ.get("RUBRUB_TEST_DATABASE_URL") and db.psycopg,
+                     "set RUBRUB_TEST_DATABASE_URL (a DISPOSABLE postgres:// database) and install psycopg to run")
+class PostgresUpgradeTest(unittest.TestCase):
+    """A Postgres database made before cities, categories and Experts existed is upgraded in place."""
+
+    def test_old_postgres_tables_get_the_new_columns_and_backfill(self):
+        previous = server.DATA_DIR
+        try:
+            server.use_postgres(os.environ["RUBRUB_TEST_DATABASE_URL"])
+            con = server.connect()
+            try:
+                con.execute("DROP TABLE IF EXISTS " + ", ".join(db.TABLE_NAMES) + " CASCADE")
+                con.executescript(db.schema_sql("postgres"))
+                con.execute("ALTER TABLE reviews DROP COLUMN city, DROP COLUMN category")  # make them look old
+                con.execute("ALTER TABLE users DROP COLUMN is_expert, DROP COLUMN expert_title")
+                uid = con.execute("INSERT INTO users(username, display_name, created_at) VALUES('old_one','Old',0) RETURNING id").fetchone()[0]
+                for i, (menu, area) in enumerate([("Pad Kra Pao Moo", "Thonglor, Bangkok"), ("Khao Soi", "Nimman, Chiang Mai")]):
+                    con.execute(
+                        "INSERT INTO reviews(user_id, restaurant_name, area, menu_item, rating, price_thb, open_days, open_time, close_time,"
+                        " created_at, updated_at) VALUES(?,'Old Cart',?,?,4,50,'Mon','09:00','17:00',?,?)", (uid, area, menu, i, i))
+                con.commit()
+                self.assertFalse(db.column_exists(con, "reviews", "city"))
+                self.assertTrue(db.column_exists(con, "reviews", "area"))
+            finally:
+                con.close()
+            server.init_db()
+            server.init_db()  # and again: nothing to do, nothing breaks
+            con = server.connect()
+            try:
+                self.assertEqual([tuple(r) for r in con.execute("SELECT category, city FROM reviews ORDER BY id")],
+                                 [("kra_pao", "bangkok"), ("noodles", "chiang_mai")])
+                self.assertEqual(tuple(con.execute("SELECT is_expert, expert_title FROM users").fetchone()), (0, ""))
+                self.assertTrue(db.column_exists(con, "reviews", "city"))
+            finally:
+                con.close()
+        finally:
+            server.configure(previous)
+
+
 class PostgresWsgiAppTest(PostgresAppTest, WsgiAppTest):
     """Exactly what runs on Vercel: the WSGI app on Postgres, configured only from Vercel-style
     environment variables (VERCEL=1 and DATABASE_URL), with the lazy cold-start set-up."""
@@ -688,7 +959,7 @@ class PostgresWsgiAppTest(PostgresAppTest, WsgiAppTest):
         server.use_postgres(url)
         con = server.connect()
         try:
-            con.execute("DROP TABLE IF EXISTS likes, photos, rate_hits, sessions, reviews, users, meta CASCADE")
+            con.execute("DROP TABLE IF EXISTS " + ", ".join(db.TABLE_NAMES) + " CASCADE")
             con.commit()
         finally:
             con.close()
@@ -776,8 +1047,9 @@ class DatabaseLayerTest(unittest.TestCase):
         self.assertIn("BYTEA", pg_sql)
         for sql in (sqlite_sql, pg_sql):
             self.assertNotRegex(sql, r"[{}]")  # every placeholder was substituted
-            for table in ("users", "sessions", "reviews", "likes", "photos", "rate_hits", "meta"):
+            for table in db.TABLE_NAMES:  # the cleanup list and the schema must never drift apart
                 self.assertIn(f"CREATE TABLE IF NOT EXISTS {table} ", sql)
+            self.assertEqual(sql.count("CREATE TABLE IF NOT EXISTS"), len(db.TABLE_NAMES))
 
     def test_row_behaves_like_sqlite3_row(self):
         row = db.Row({"id": 0, "name": 1}, (7, "x"))
@@ -1046,9 +1318,35 @@ class DeployFilesTest(unittest.TestCase):
         self.assertEqual(len(en_keys), len(set(en_keys)))  # no duplicated key hiding another
         # every error code the server can answer with has a message the page can show
         codes = set(re.findall(r'ApiError\(\d+, "(\w+)"', self.read("rubrub.py")))
+        codes |= set(re.findall(r'\{"\w+": "(\w+)"\}', self.read("rubrub.py")))  # field errors such as {"name": "name_taken"}
         codes |= {db.DatabaseNotConfigured.code, db.DriverMissing.code, db.DatabaseUnavailable.code, "server_error"}
         for code in codes - {"validation"}:
             self.assertIn(f"err.{code}", en_keys, f"no message for error code {code}")
+
+    def test_every_text_the_page_asks_for_exists(self):
+        """app.js looks texts up by key. A typo would show the raw key to visitors, so check them all."""
+        js, i18n = self.read("public/js/app.js"), self.read("public/js/i18n.js")
+        english = i18n.split("\n  th: {")[0]
+        have = set(re.findall(r'(?:^[ \t]*|,[ \t]*)"?([A-Za-z][\w.]*)"?[ \t]*:[ \t]*"', english, re.M))
+        used = set(re.findall(r"""\bt\('([A-Za-z][\w.]*)'""", js)) | set(re.findall(r"""askLogin\('([\w.]+)'\)""", js))
+        used = {key for key in used if not key.endswith(".")}  # t('cat.' + x) builds its key: checked below
+        self.assertGreater(len(used), 150)  # the pattern really found the lookups
+        self.assertEqual(sorted(used - have), [], "texts used by app.js that do not exist")
+        dynamic = ([f"cat.{c}" for c in server.CATEGORIES] + [f"city.{c}" for c in server.CITIES]
+                   + [f"pay.{p}" for p in server.PAYMENTS] + [f"rate.{n}" for n in range(1, 6)] + [f"spice.{n}" for n in range(4)]
+                   + [f"day.{d}" for d in server.DAYS] + [f"dayFull.{d}" for d in server.DAYS])
+        self.assertEqual(sorted(set(dynamic) - have), [], "texts built from a prefix that do not exist")
+
+    def test_city_and_category_words_match_between_python_and_javascript(self):
+        js = self.read("public/js/app.js")
+        for table, name in ((server.CITY_KEYWORDS, "CITY_WORDS"), (server.CATEGORY_KEYWORDS, "CAT_WORDS")):
+            block = js.split(f"const {name} = ")[1].split("function ")[0]
+            for key, words in table:
+                self.assertIn(f"'{key}'", block, key)
+                for word in words:
+                    self.assertIn(f"'{word}'", block, f"{word} ({key}) is in rubrub.py but not in app.js")
+        self.assertEqual([c for c in server.CITIES if c != "other"], [k for k, _ in server.CITY_KEYWORDS])
+        self.assertIn("const CITIES = [" + ", ".join(f"'{c}'" for c in server.CITIES) + "]", js)
 
     def test_dockerfile_copies_the_files_the_app_needs(self):
         dockerfile, ignore = self.read("Dockerfile"), self.read(".dockerignore").split()
@@ -1071,15 +1369,20 @@ class UpgradeTest(unittest.TestCase):
             try:
                 server.configure(tmp)
                 current = db.schema_sql("sqlite")
-                old_schema = current.replace("    category        TEXT NOT NULL DEFAULT 'other',\n", "")
+                old_schema = current
+                for line in ("    category        TEXT NOT NULL DEFAULT 'other',\n", "    city            TEXT NOT NULL DEFAULT 'other',\n",
+                             "    is_expert    INTEGER NOT NULL DEFAULT 0,\n", "    expert_title TEXT NOT NULL DEFAULT '',\n"):
+                    self.assertIn(line, old_schema)
+                    old_schema = old_schema.replace(line, "")  # what the tables looked like before these columns existed
                 self.assertNotEqual(old_schema, current)
                 con = sqlite3.connect(Path(tmp) / "rubrub.db")
                 con.executescript(old_schema)
                 con.execute("INSERT INTO users(id, username, display_name, bio, is_featured, created_at) VALUES(1,'claude','Claude','',1,0)")
-                for i, menu in enumerate(["Pad Kra Pao Moo", "Khao Man Gai", "Boat Noodles", "Som Tam"]):
+                for i, (menu, area) in enumerate([("Pad Kra Pao Moo", "Ari, Bangkok"), ("Khao Man Gai", "Nimman, Chiang Mai"),
+                                                  ("Boat Noodles", "Phuket Old Town"), ("Som Tam", "")]):
                     con.execute(
-                        "INSERT INTO reviews(user_id, restaurant_name, menu_item, rating, price_thb, open_days, open_time, close_time,"
-                        " created_at, updated_at) VALUES(1,'Old Cart',?,4,50,'Mon','09:00','17:00',?,?)", (menu, i, i))
+                        "INSERT INTO reviews(user_id, restaurant_name, area, menu_item, rating, price_thb, open_days, open_time, close_time,"
+                        " created_at, updated_at) VALUES(1,'Old Cart',?,?,4,50,'Mon','09:00','17:00',?,?)", (area, menu, i, i))
                 con.commit()
                 con.close()
 
@@ -1088,6 +1391,10 @@ class UpgradeTest(unittest.TestCase):
                 try:
                     cats = [r[0] for r in con.execute("SELECT category FROM reviews ORDER BY id")]
                     self.assertEqual(cats, ["kra_pao", "khao_man_gai", "noodles", "other"])
+                    cities = [r[0] for r in con.execute("SELECT city FROM reviews ORDER BY id")]
+                    self.assertEqual(cities, ["bangkok", "chiang_mai", "phuket", "other"])
+                    self.assertEqual(con.execute("SELECT is_expert, expert_title FROM users").fetchone()[:], (0, ""))
+                    server.init_db()  # running it again changes nothing and does not fail
                     self.assertTrue(server.seed(con))  # existing 'claude' kept, tester + fans added
                     self.assertEqual(con.execute("SELECT COUNT(*) FROM users WHERE username = 'claude'").fetchone()[0], 1)
                     self.assertEqual(con.execute("SELECT COUNT(*) FROM reviews WHERE user_id = 1").fetchone()[0], 4)

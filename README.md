@@ -30,6 +30,7 @@ Then open <http://localhost:8000> (or double-click `start.bat` on Windows).
 | `--database-url URL` | use a Postgres database instead (needs `pip install "psycopg[binary]"`) |
 | `--no-seed` | don't create the sample Claude blogger and demo reviews |
 | `--reset-password NAME` | set a new password for a user, then exit (also your "forgot password" tool) |
+| `--set-expert NAME --expert-title "Food writer"` | give a user the Expert badge, then exit (`--remove-expert NAME` takes it away) |
 
 Hosting options (`--trust-proxy`, `--proxy-hops`, `--secure-cookies`, `--run-as-uid`) and the
 matching environment variables are listed under [Environment variables](#environment-variables).
@@ -44,7 +45,8 @@ On first run two demo profiles are created. Both are locked until you give them 
 
 Twelve more locked `demo_…` foodies (Nok, Pim, Ton, …) like the reviews, and eight of them wrote
 one review each, so a fresh site shows **22 sample reviews** from 10 profiles, spread over every
-category and payment type.
+category, payment type and seven cities. Claude, `demo_ton` and `demo_nok` are sample **Experts**,
+and Claude and Test Eater have four sample **collections** between them.
 
 All the sample reviews are demo data: the vendors in them are **fictional** and are
 labelled "Sample" in the app. To start clean, delete the `data` folder before you launch
@@ -57,6 +59,29 @@ Anyone whose reviews collect **25 likes from other people** (`FAMOUS_LIKES` in `
 earns the **Famous reviewer** badge, which appears on their profile, next to their name on
 every review, and in the "Famous reviewers" row on the home page. You can't like your own
 reviews.
+
+### Saved places, collections, destinations, Experts and Ask
+Features for finding good places, not only for writing reviews. All are in English and Thai.
+
+- **Save for later:** the bookmark on any review adds it to a private wishlist (menu → **Saved**).
+- **Collections:** group places into named lists ("Bangkok noodles") from the review page,
+  your profile or the sheet that opens from **Add to collection**. A collection is public (anyone
+  with the link can open it) or private, and each person can keep up to 30 of up to 200 places.
+- **Destinations:** every review has a **city** (Bangkok, Chiang Mai, Phuket, Chonburi & Pattaya,
+  Hat Yai, Ayutthaya, Khon Kaen, Chiang Rai, Krabi, Hua Hin, Koh Samui or Other), guessed from the
+  area text in the form. The home page and **Destinations** list the cities, and each city has its
+  own page with the usual filters. Reviews written before cities existed are sorted automatically
+  the next time the server starts.
+- **Experts and Members:** an **Expert** is a label *you* give to people who know street food well;
+  everybody else is a Member. Experts get a chef's-hat mark and a title, a filter **Experts only**,
+  and their tips come first in Ask. There is no way to become one by signing up. After the person has
+  an account, run `python rubrub.py --set-expert their_username --expert-title "Street food chef"`
+  (add `--database-url` for a Postgres site; `--remove-expert` undoes it).
+- **Ask the community:** type a question in plain English or Thai ("cheap cash-only noodles in
+  Chiang Mai", "ข้าวกระเพราเผ็ดๆ ในกรุงเทพ"). It understands dish, city, payment, price, spice, "late
+  night", "breakfast" and "experts", then answers *only* from the reviews on your site, with Experts'
+  tips first and who recommended each place. If nothing fits it says so and suggests where to start.
+  It uses fixed rules (no paid AI, no outside service), so it only understands what it was taught.
 
 ### Food categories
 Every review has a category: **ข้าวมันไก่ (Khao Man Gai) · ข้าวกระเพรา (Pad Kra Pao) ·

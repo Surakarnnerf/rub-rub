@@ -109,12 +109,28 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 PAYMENTS = ("cash_only", "qr", "card")
 CATEGORIES = ("khao_man_gai", "kra_pao", "noodles", "other")  # ข้าวมันไก่, ข้าวกระเพรา, ก๋วยเตี๋ยว, อื่นๆ
 FAMOUS_LIKES = 25  # likes received (on all their reviews) before a reviewer earns the "famous" badge
-SEED_VERSION = 3  # 2 = Claude + Test Eater, 3 = eight more sample reviews from other sample foodies
+SEED_VERSION = 4  # 2 = Claude + Test Eater, 3 = eight more sample reviews, 4 = experts and sample collections
 CATEGORY_KEYWORDS = (  # checked in order; keep in sync with guessCategory() in public/js/app.js
     ("khao_man_gai", ("khao man gai", "kao man gai", "man gai", "hainan", "ข้าวมันไก่")),
     ("kra_pao", ("kra pao", "kaprao", "krapow", "ka prao", "กะเพรา", "กระเพรา")),
     ("noodles", ("noodle", "kuay teow", "guay teow", "kway teow", "ba mee", "bamee", "pad thai", "khao soi", "pad see ew",
                  "rad na", "wonton", "ก๋วยเตี๋ยว", "บะหมี่", "เส้น", "ผัดไทย", "ข้าวซอย", "ราดหน้า")),
+)
+CITIES = ("bangkok", "chiang_mai", "phuket", "chonburi", "hat_yai", "ayutthaya", "khon_kaen", "chiang_rai", "krabi",
+          "hua_hin", "samui", "other")
+CITY_KEYWORDS = (  # checked in order; keep in sync with CITY_WORDS in public/js/app.js
+    ("bangkok", ("bangkok", "krung thep", "กรุงเทพ", "yaowarat", "silom", "sathorn", "sukhumvit", "thonglor", "ratchada",
+                 "chatuchak", "phra nakhon", "khao san", "ratchathewi")),
+    ("chiang_mai", ("chiang mai", "เชียงใหม่", "nimman")),
+    ("phuket", ("phuket", "ภูเก็ต")),
+    ("chonburi", ("chonburi", "pattaya", "ชลบุรี", "พัทยา", "bang saen")),
+    ("hat_yai", ("hat yai", "hatyai", "songkhla", "หาดใหญ่", "สงขลา")),
+    ("ayutthaya", ("ayutthaya", "อยุธยา")),
+    ("khon_kaen", ("khon kaen", "ขอนแก่น")),
+    ("chiang_rai", ("chiang rai", "เชียงราย")),
+    ("krabi", ("krabi", "กระบี่", "ao nang")),
+    ("hua_hin", ("hua hin", "หัวหิน")),
+    ("samui", ("samui", "สมุย", "surat thani", "สุราษฎร์")),
 )
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -152,12 +168,19 @@ PHOTO_TYPES = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
 
 # The table definitions live in db.py (they differ a little between SQLite and Postgres).
 REVIEW_SELECT = """
-SELECT r.*, u.username, u.display_name, u.is_featured,
+SELECT r.*, u.username, u.display_name, u.is_featured, u.is_expert, u.expert_title,
        (SELECT COUNT(*) FROM likes l2 JOIN reviews r2 ON r2.id = l2.review_id WHERE r2.user_id = u.id) AS author_likes,
        (SELECT COUNT(*) FROM likes l WHERE l.review_id = r.id) AS like_count,
-       EXISTS(SELECT 1 FROM likes l WHERE l.review_id = r.id AND l.user_id = ?) AS liked
+       EXISTS(SELECT 1 FROM likes l WHERE l.review_id = r.id AND l.user_id = ?) AS liked,
+       EXISTS(SELECT 1 FROM saves sv WHERE sv.review_id = r.id AND sv.user_id = ?) AS saved
 FROM reviews r JOIN users u ON u.id = r.user_id
 """
+
+
+def viewer_args(me) -> list:
+    """The two values REVIEW_SELECT asks for first: who is looking (-1 = nobody), for liked and saved."""
+    vid = me["id"] if me else -1
+    return [vid, vid]
 
 SORTS = {
     "new": "r.created_at DESC, r.id DESC",
@@ -190,8 +213,25 @@ def guess_category(text: str) -> str:
     return "other"
 
 
+def guess_city(text: str) -> str:
+    s = (text or "").lower()
+    for city, words in CITY_KEYWORDS:
+        if any(w in s for w in words):
+            return city
+    return "other"
+
+
+# Columns added after the first release: (table, column, definition). Older databases get them in init_db.
+LATER_COLUMNS = (
+    ("reviews", "category", "TEXT NOT NULL DEFAULT 'other'"),
+    ("reviews", "city", "TEXT NOT NULL DEFAULT 'other'"),
+    ("users", "is_expert", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "expert_title", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
 def init_db() -> None:
-    """Create the tables (and upgrade an older SQLite file). Safe to run on every start."""
+    """Create the tables and upgrade an older database. Safe to run on every start."""
     if db.engine() == "sqlite":
         DATA_DIR.mkdir(parents=True, exist_ok=True)
     con = connect()
@@ -199,13 +239,18 @@ def init_db() -> None:
         if con.engine == "sqlite":
             con.execute("PRAGMA journal_mode = WAL")
         con.executescript(db.schema_sql(con.engine))
-        if con.engine == "sqlite":
-            # upgrade a file created before categories existed
-            cols = {r["name"] for r in con.execute("PRAGMA table_info(reviews)")}
-            if "category" not in cols:
-                con.execute("ALTER TABLE reviews ADD COLUMN category TEXT NOT NULL DEFAULT 'other'")
-                for r in con.execute("SELECT id, menu_item FROM reviews").fetchall():
-                    con.execute("UPDATE reviews SET category = ? WHERE id = ?", (guess_category(r["menu_item"]), r["id"]))
+        added = set()
+        for table, column, definition in LATER_COLUMNS:  # a database made before these columns existed
+            if not db.column_exists(con, table, column):
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                added.add(column)
+        if "category" in added:
+            for r in con.execute("SELECT id, menu_item FROM reviews").fetchall():
+                con.execute("UPDATE reviews SET category = ? WHERE id = ?", (guess_category(r["menu_item"]), r["id"]))
+        if "city" in added:
+            for r in con.execute("SELECT id, area, restaurant_name FROM reviews").fetchall():
+                con.execute("UPDATE reviews SET city = ? WHERE id = ?", (guess_city(r["area"] + " " + r["restaurant_name"]), r["id"]))
+        con.execute("CREATE INDEX IF NOT EXISTS idx_reviews_city ON reviews(city)")
         con.commit()
     finally:
         con.close()
@@ -342,6 +387,14 @@ def validate_review(d: dict, con) -> dict:
     text("area", 0, 80, required=False)
     text("menu_item", 2, 80)
 
+    city = d.get("city")
+    if city in (None, ""):
+        city = guess_city(f"{out['area']} {out['restaurant_name']}")  # API clients may omit it
+    elif not isinstance(city, str) or city not in CITIES:
+        errors["city"] = "invalid"
+        city = "other"
+    out["city"] = city
+
     category = d.get("category")
     if category in (None, ""):
         category = guess_category(out["menu_item"])  # API clients may omit it
@@ -425,7 +478,8 @@ def validate_review(d: dict, con) -> dict:
 def me_json(u) -> dict | None:
     if not u:
         return None
-    return {"username": u["username"], "display_name": u["display_name"], "is_featured": bool(u["is_featured"])}
+    return {"username": u["username"], "display_name": u["display_name"], "is_featured": bool(u["is_featured"]),
+            "is_expert": bool(u["is_expert"]), "expert_title": u["expert_title"]}
 
 
 def review_json(r) -> dict:
@@ -434,6 +488,7 @@ def review_json(r) -> dict:
         "id": r["id"],
         "restaurant_name": r["restaurant_name"],
         "area": r["area"],
+        "city": r["city"],
         "menu_item": r["menu_item"],
         "category": r["category"],
         "rating": r["rating"],
@@ -450,11 +505,14 @@ def review_json(r) -> dict:
         "updated_at": r["updated_at"],
         "likes": r["like_count"],
         "liked": bool(r["liked"]),
+        "saved": bool(r["saved"]),
         "author": {
             "username": r["username"],
             "display_name": r["display_name"],
             "is_featured": bool(r["is_featured"]),
             "is_famous": r["author_likes"] >= FAMOUS_LIKES,
+            "is_expert": bool(r["is_expert"]),
+            "expert_title": r["expert_title"],
         },
     }
 
@@ -465,6 +523,8 @@ def user_json(u, review_count: int, avg, likes_received: int) -> dict:
         "display_name": u["display_name"],
         "bio": u["bio"],
         "is_featured": bool(u["is_featured"]),
+        "is_expert": bool(u["is_expert"]),
+        "expert_title": u["expert_title"],
         "is_famous": likes_received >= FAMOUS_LIKES,
         "famous_at": FAMOUS_LIKES,
         "created_at": u["created_at"],
@@ -584,7 +644,6 @@ def api_logout(h, q):
 @route("GET", "/api/reviews")
 def api_reviews(h, q):
     me = h.current_user()
-    me_id = me["id"] if me else -1
     where, args = [], []
 
     text = qstr(q, "q").strip()[:80]
@@ -606,6 +665,12 @@ def api_reviews(h, q):
     if category in CATEGORIES:
         where.append("r.category = ?")
         args.append(category)
+    city = qstr(q, "city")
+    if city in CITIES:
+        where.append("r.city = ?")
+        args.append(city)
+    if qstr(q, "expert") == "1":
+        where.append("u.is_expert = 1")  # tips from Experts only
     min_rating = qint(q, "min_rating", 0, 0, 5)
     if min_rating:
         where.append("r.rating >= ?")
@@ -626,14 +691,13 @@ def api_reviews(h, q):
         "SELECT COUNT(*) FROM reviews r JOIN users u ON u.id = r.user_id" + clause, args
     ).fetchone()[0]
     rows = h.con.execute(
-        REVIEW_SELECT + clause + f" ORDER BY {order} LIMIT ? OFFSET ?", [me_id, *args, limit, offset]
+        REVIEW_SELECT + clause + f" ORDER BY {order} LIMIT ? OFFSET ?", [*viewer_args(me), *args, limit, offset]
     ).fetchall()
     return {"reviews": [review_json(r) for r in rows], "total": total}
 
 
 def fetch_review(h, review_id: int):
-    me = h.current_user()
-    return h.con.execute(REVIEW_SELECT + " WHERE r.id = ?", (me["id"] if me else -1, review_id)).fetchone()
+    return h.con.execute(REVIEW_SELECT + " WHERE r.id = ?", (*viewer_args(h.current_user()), review_id)).fetchone()
 
 
 @route("GET", r"/api/reviews/(\d+)")
@@ -645,7 +709,7 @@ def api_review_get(h, q, rid):
 
 
 REVIEW_COLUMNS = (
-    "restaurant_name", "area", "menu_item", "category", "rating", "price_thb", "cash_only", "pay_qr", "pay_card",
+    "restaurant_name", "area", "city", "menu_item", "category", "rating", "price_thb", "cash_only", "pay_qr", "pay_card",
     "open_days", "open_time", "close_time", "spice", "body", "photo",
 )
 
@@ -743,6 +807,383 @@ def api_famous_users(h, q):
         (FAMOUS_LIKES, qint(q, "limit", 6, 1, 20)),
     ).fetchall()
     return {"users": [user_json(u, u["n"], u["avg"], u["got"]) for u in rows]}
+
+
+# --------------------------------------------------------------------------
+# Saved places, collections, destinations, experts and "ask the community"
+# --------------------------------------------------------------------------
+MAX_COLLECTIONS = 30
+MAX_COLLECTION_ITEMS = 200
+
+
+@route("POST", r"/api/reviews/(\d+)/save")
+def api_save(h, q, rid):
+    """Save for later (a private wishlist). Toggles."""
+    me = h.require_user()
+    if not h.con.execute("SELECT 1 FROM reviews WHERE id = ?", (int(rid),)).fetchone():
+        raise ApiError(404, "not_found")
+    removed = h.con.execute("DELETE FROM saves WHERE user_id = ? AND review_id = ?", (me["id"], int(rid))).rowcount
+    saved = removed == 0
+    if saved:
+        # milliseconds, not seconds: two taps in the same second must still come back newest first
+        h.con.execute("INSERT INTO saves(user_id, review_id, created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+                      (me["id"], int(rid), int(time.time() * 1000)))
+    return {"saved": saved}
+
+
+@route("GET", "/api/saved")
+def api_saved(h, q):
+    me = h.require_user()
+    limit, offset = qint(q, "limit", 24, 1, 50), qint(q, "offset", 0, 0, 100000)
+    total = h.con.execute("SELECT COUNT(*) FROM saves WHERE user_id = ?", (me["id"],)).fetchone()[0]
+    rows = h.con.execute(
+        REVIEW_SELECT + " JOIN saves sv2 ON sv2.review_id = r.id AND sv2.user_id = ?"
+        " ORDER BY sv2.created_at DESC, r.id DESC LIMIT ? OFFSET ?",
+        [*viewer_args(me), me["id"], limit, offset],
+    ).fetchall()
+    return {"reviews": [review_json(r) for r in rows], "total": total}
+
+
+COLLECTION_SELECT = """
+SELECT c.*, u.username, u.display_name, u.is_featured, u.is_expert, u.expert_title,
+       (SELECT COUNT(*) FROM collection_items ci WHERE ci.collection_id = c.id) AS item_count,
+       (SELECT r.photo FROM collection_items ci JOIN reviews r ON r.id = ci.review_id
+         WHERE ci.collection_id = c.id AND r.photo IS NOT NULL ORDER BY ci.added_at DESC, r.id DESC LIMIT 1) AS cover_photo,
+       (SELECT r.category FROM collection_items ci JOIN reviews r ON r.id = ci.review_id
+         WHERE ci.collection_id = c.id ORDER BY ci.added_at DESC, r.id DESC LIMIT 1) AS cover_category
+FROM collections c JOIN users u ON u.id = c.user_id
+"""
+
+
+def collection_json(c) -> dict:
+    return {
+        "id": c["id"],
+        "name": c["name"],
+        "description": c["description"],
+        "is_public": bool(c["is_public"]),
+        "item_count": c["item_count"],
+        "cover_photo": f"/uploads/{c['cover_photo']}" if c["cover_photo"] else None,
+        "cover_category": c["cover_category"],
+        "created_at": c["created_at"],
+        "updated_at": c["updated_at"],
+        "owner": {
+            "username": c["username"],
+            "display_name": c["display_name"],
+            "is_featured": bool(c["is_featured"]),
+            "is_expert": bool(c["is_expert"]),
+            "expert_title": c["expert_title"],
+        },
+    }
+
+
+def validate_collection(d: dict) -> dict:
+    errors = {}
+    name = clean_line(d.get("name"))
+    if not name:
+        errors["name"] = "required"
+    elif len(name) < 2:
+        errors["name"] = "too_short"
+    elif len(name) > 60:
+        errors["name"] = "too_long"
+    description = clean_text(d.get("description"))
+    if len(description) > 200:
+        errors["description"] = "too_long"
+    public = d.get("is_public", True)
+    if not isinstance(public, bool):
+        if public in (0, 1):
+            public = bool(public)
+        else:
+            errors["is_public"] = "invalid"
+            public = True
+    if errors:
+        raise ApiError(400, "validation", errors)
+    return {"name": name, "description": description, "is_public": int(public)}
+
+
+def visible_collection(h, cid: int):
+    """A collection the current visitor may see: public ones, and their own private ones."""
+    c = h.con.execute(COLLECTION_SELECT + " WHERE c.id = ?", (cid,)).fetchone()
+    me = h.current_user()
+    if not c or not (c["is_public"] or (me and me["id"] == c["user_id"])):
+        raise ApiError(404, "not_found")
+    return c
+
+
+def owned_collection(h, cid: int):
+    me = h.require_user()
+    c = h.con.execute(COLLECTION_SELECT + " WHERE c.id = ?", (cid,)).fetchone()
+    if not c:
+        raise ApiError(404, "not_found")
+    if c["user_id"] != me["id"]:
+        raise ApiError(403, "forbidden")
+    return c
+
+
+@route("POST", "/api/collections")
+def api_collection_create(h, q):
+    me = h.require_user()
+    if not rate_ok(h.con, f"collection:{me['id']}", 30, 3600):
+        raise ApiError(429, "rate_limited")
+    data = validate_collection(h.read_json())
+    if h.con.execute("SELECT COUNT(*) FROM collections WHERE user_id = ?", (me["id"],)).fetchone()[0] >= MAX_COLLECTIONS:
+        raise ApiError(400, "validation", {"name": "too_many_collections"})
+    now = int(time.time())
+    try:
+        cid = h.con.execute(
+            "INSERT INTO collections(user_id, name, description, is_public, created_at, updated_at) VALUES(?,?,?,?,?,?) RETURNING id",
+            (me["id"], data["name"], data["description"], data["is_public"], now, now),
+        ).fetchone()[0]
+    except db.integrity_errors:
+        raise ApiError(409, "validation", {"name": "name_taken"})  # one collection per name for each person
+    return 201, {"collection": collection_json(visible_collection(h, cid))}
+
+
+@route("GET", r"/api/collections/(\d+)")
+def api_collection_get(h, q, cid):
+    c = visible_collection(h, int(cid))
+    me = h.current_user()
+    rows = h.con.execute(
+        REVIEW_SELECT + " JOIN collection_items ci2 ON ci2.review_id = r.id AND ci2.collection_id = ?"
+        " ORDER BY ci2.added_at DESC, r.id DESC LIMIT 100",
+        [*viewer_args(me), c["id"]],
+    ).fetchall()
+    return {"collection": collection_json(c), "reviews": [review_json(r) for r in rows],
+            "mine": bool(me and me["id"] == c["user_id"])}
+
+
+@route("PUT", r"/api/collections/(\d+)")
+def api_collection_update(h, q, cid):
+    c = owned_collection(h, int(cid))
+    data = validate_collection(h.read_json())
+    try:
+        h.con.execute("UPDATE collections SET name = ?, description = ?, is_public = ?, updated_at = ? WHERE id = ?",
+                      (data["name"], data["description"], data["is_public"], int(time.time()), c["id"]))
+    except db.integrity_errors:
+        raise ApiError(409, "validation", {"name": "name_taken"})
+    return {"collection": collection_json(visible_collection(h, c["id"]))}
+
+
+@route("DELETE", r"/api/collections/(\d+)")
+def api_collection_delete(h, q, cid):
+    c = owned_collection(h, int(cid))
+    h.con.execute("DELETE FROM collections WHERE id = ?", (c["id"],))
+    return {"ok": True}
+
+
+@route("POST", r"/api/collections/(\d+)/items")
+def api_collection_add(h, q, cid):
+    c = owned_collection(h, int(cid))
+    rid = as_int(h.read_json().get("review_id"))
+    if rid is None or not h.con.execute("SELECT 1 FROM reviews WHERE id = ?", (rid,)).fetchone():
+        raise ApiError(404, "not_found")
+    if c["item_count"] >= MAX_COLLECTION_ITEMS:
+        raise ApiError(400, "validation", {"review_id": "collection_full"})
+    added = h.con.execute(
+        "INSERT INTO collection_items(collection_id, review_id, added_at) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+        (c["id"], rid, int(time.time() * 1000)),  # milliseconds, so the order of additions is exact
+    ).rowcount == 1
+    h.con.execute("UPDATE collections SET updated_at = ? WHERE id = ?", (int(time.time()), c["id"]))
+    count = h.con.execute("SELECT COUNT(*) FROM collection_items WHERE collection_id = ?", (c["id"],)).fetchone()[0]
+    return 201 if added else 200, {"added": added, "item_count": count}
+
+
+@route("DELETE", r"/api/collections/(\d+)/items/(\d+)")
+def api_collection_remove(h, q, cid, rid):
+    c = owned_collection(h, int(cid))
+    removed = h.con.execute("DELETE FROM collection_items WHERE collection_id = ? AND review_id = ?", (c["id"], int(rid))).rowcount
+    h.con.execute("UPDATE collections SET updated_at = ? WHERE id = ?", (int(time.time()), c["id"]))
+    count = h.con.execute("SELECT COUNT(*) FROM collection_items WHERE collection_id = ?", (c["id"],)).fetchone()[0]
+    return {"removed": removed == 1, "item_count": count}
+
+
+@route("GET", r"/api/users/([A-Za-z0-9_]{3,20})/collections")
+def api_user_collections(h, q, username):
+    owner = h.con.execute("SELECT id FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
+    if not owner:
+        raise ApiError(404, "not_found")
+    me = h.current_user()
+    mine = bool(me and me["id"] == owner["id"])
+    rows = h.con.execute(
+        COLLECTION_SELECT + " WHERE c.user_id = ?" + ("" if mine else " AND c.is_public = 1")
+        + " ORDER BY c.updated_at DESC, c.id DESC",
+        (owner["id"],),
+    ).fetchall()
+    return {"collections": [collection_json(c) for c in rows], "mine": mine}
+
+
+@route("GET", "/api/me/collections")
+def api_my_collections(h, q):
+    """My collections, and (when review_id is given) which of them already hold that review."""
+    me = h.require_user()
+    rows = h.con.execute(COLLECTION_SELECT + " WHERE c.user_id = ? ORDER BY c.updated_at DESC, c.id DESC", (me["id"],)).fetchall()
+    holding = set()
+    rid = qint(q, "review_id", 0, 0, 10 ** 9)
+    if rid:
+        holding = {r[0] for r in h.con.execute(
+            "SELECT collection_id FROM collection_items WHERE review_id = ? AND collection_id IN "
+            "(SELECT id FROM collections WHERE user_id = ?)", (rid, me["id"]))}
+    return {"collections": [dict(collection_json(c), has_review=c["id"] in holding) for c in rows]}
+
+
+@route("GET", "/api/cities")
+def api_cities(h, q):
+    """Destinations that have reviews, busiest first."""
+    rows = h.con.execute("SELECT city, COUNT(*) AS n FROM reviews GROUP BY city ORDER BY n DESC, city").fetchall()
+    return {"cities": [{"city": r["city"], "count": r["n"]} for r in rows]}
+
+
+@route("GET", "/api/experts")
+def api_experts(h, q):
+    rows = h.con.execute(
+        """SELECT * FROM (
+               SELECT u.*, COUNT(r.id) AS n, AVG(r.rating) AS avg,
+                      (SELECT COUNT(*) FROM likes l JOIN reviews r2 ON r2.id = l.review_id WHERE r2.user_id = u.id) AS got
+               FROM users u LEFT JOIN reviews r ON r.user_id = u.id
+               WHERE u.is_expert = 1
+               GROUP BY u.id
+           ) t
+           ORDER BY n DESC, got DESC LIMIT 50"""
+    ).fetchall()
+    return {"experts": [user_json(u, u["n"], u["avg"], u["got"]) for u in rows]}
+
+
+# --- ask the community: understands a question with plain rules (no paid AI) and answers from our own reviews ---
+ASK_CATEGORY_EXTRA = {
+    "khao_man_gai": ("chicken rice", "hainanese"),
+    "kra_pao": ("basil", "krapao", "pad kaprow"),
+    "noodles": ("noodles", "ramen", "mee ", "bamee"),
+}
+ASK_STOPWORDS = frozenset(
+    "the and for with from that this what where which who how any can you your are best good great nice find show give want "
+    "need looking look place places spot spots restaurant restaurants food eat eating near around some tell please recommend "
+    "recommendation recommendations tips tip please under below than less cheaper cheap cheapest budget affordable only "
+    "spicy hot mild not late night midnight early morning breakfast expert experts baht thb pay paying payment accept "
+    "accepts open cash qr promptpay card cards credit scan dish dishes menu lunch dinner snack snacks street thai thailand "
+    "stall stalls cart carts vendor vendors shop shops koh".split())
+# Thai words that carry no dish or place ("price", "shop", "open", "from"...): removed from a chunk of Thai text
+ASK_THAI_FILLER = ("ราคา", "ถูก", "ร้าน", "เปิด", "ดึก", "เผ็ด", "ไม่เผ็ด", "เงินสด", "สแกน", "บัตร", "จาก", "ผู้เชี่ยวชาญ",
+                   "แนะนำ", "อร่อย", "เช้า", "ที่", "ใน", "ๆ", "ข้าว", "อาหาร", "เมนู", "กิน")
+
+
+def interpret_question(text: str) -> dict:
+    """What the visitor asked for, as filters. Understands English and some Thai."""
+    s = " " + text.lower() + " "
+    found = {"category": None, "city": None, "payment": None, "max_price": None, "spice": None,
+             "late": False, "morning": False, "expert": False}
+    used = set()
+    for cat, words in CATEGORY_KEYWORDS:
+        hit = [w for w in (*words, *ASK_CATEGORY_EXTRA.get(cat, ())) if w in s]
+        if hit:
+            found["category"] = cat
+            used.update(hit)
+            break
+    for city, words in CITY_KEYWORDS:
+        hit = [w for w in words if w in s]
+        if hit:
+            found["city"] = city
+            used.update(hit)
+            break
+    if re.search(r"\bcash\b|เงินสด", s):
+        found["payment"] = "cash_only"
+    elif re.search(r"\bqr\b|promptpay|สแกน", s):
+        found["payment"] = "qr"
+    elif re.search(r"\bcards?\b|credit|บัตร", s):
+        found["payment"] = "card"
+    price = re.search(r"(?:under|below|less than|cheaper than|max|ไม่เกิน|ต่ำกว่า)\s*(?:฿|thb|baht)?\s*(\d{2,4})", s)
+    if price:
+        found["max_price"] = int(price.group(1))
+    elif re.search(r"\b(?:cheap|cheapest|budget|affordable)\b|ถูก", s):
+        found["max_price"] = 60
+    if re.search(r"not spicy|non-spicy|\bmild\b|no chili|ไม่เผ็ด", s):
+        found["spice"] = "mild"
+    elif re.search(r"\b(?:spicy|hot|fiery)\b|เผ็ด", s):
+        found["spice"] = "hot"
+    found["late"] = bool(re.search(r"\b(?:late|midnight|night)\b|ดึก", s))
+    found["morning"] = bool(re.search(r"\b(?:breakfast|morning|early)\b|เช้า", s))
+    found["expert"] = bool(re.search(r"\bexperts?\b|ผู้เชี่ยวชาญ", s))
+    leftovers = []
+    for token in re.findall(r"[a-z0-9ก-๙']{3,}", s):
+        if re.search(r"[ก-๙]", token):  # Thai has no spaces: take the words we know out of the chunk, keep what is left
+            rest = token
+            for word in sorted((*used, *ASK_THAI_FILLER), key=len, reverse=True):
+                rest = rest.replace(word.strip(), "")
+            if len(rest) >= 3:
+                leftovers.append(rest)
+        elif token not in ASK_STOPWORDS and not any(token in u or u.strip() in token for u in used):
+            leftovers.append(token)
+    found["words"] = leftovers[:5]
+    return found
+
+
+def ask_filter(found: dict, with_words: bool):
+    where, args = [], []
+    if found["category"]:
+        where.append("r.category = ?")
+        args.append(found["category"])
+    if found["city"]:
+        where.append("r.city = ?")
+        args.append(found["city"])
+    pay_column = {"cash_only": "r.cash_only", "qr": "r.pay_qr", "card": "r.pay_card"}.get(found["payment"])
+    if pay_column:
+        where.append(f"{pay_column} = 1")
+    if found["max_price"]:
+        where.append("r.price_thb <= ?")
+        args.append(found["max_price"])
+    if found["spice"] == "mild":
+        where.append("r.spice <= 1")
+    elif found["spice"] == "hot":
+        where.append("r.spice >= 2")
+    if found["late"]:
+        where.append("(r.close_time < r.open_time OR r.close_time >= '22:00')")
+    if found["morning"]:
+        where.append("r.open_time <= '08:00'")
+    if found["expert"]:
+        where.append("u.is_expert = 1")
+    if with_words and found["words"]:
+        ors = []
+        for word in found["words"]:
+            like = "%" + like_escape(word) + "%"
+            ors.append("(lower(r.menu_item) LIKE ? ESCAPE '\\' OR lower(r.restaurant_name) LIKE ? ESCAPE '\\' "
+                       "OR lower(r.area) LIKE ? ESCAPE '\\' OR lower(r.body) LIKE ? ESCAPE '\\')")
+            args += [like] * 4
+        where.append("(" + " OR ".join(ors) + ")")
+    return where, args
+
+
+@route("GET", "/api/ask")
+def api_ask(h, q):
+    if not rate_ok(h.con, f"ask:{h.client_ip()}", 60, 600):
+        raise ApiError(429, "rate_limited")
+    question = clean_line(qstr(q, "q"))
+    if not question:
+        raise ApiError(400, "validation", {"q": "required"})
+    if len(question) > 200:
+        raise ApiError(400, "validation", {"q": "too_long"})
+    me = h.current_user()
+    found = interpret_question(question)
+    structured = any(found[k] for k in ("category", "city", "payment", "max_price", "spice", "late", "morning", "expert"))
+
+    def run(with_words: bool):
+        where, args = ask_filter(found, with_words)
+        if not where:
+            return []
+        return h.con.execute(
+            REVIEW_SELECT + " WHERE " + " AND ".join(where)
+            + " ORDER BY u.is_expert DESC, like_count DESC, r.rating DESC, r.id DESC LIMIT 5",
+            [*viewer_args(me), *args],
+        ).fetchall()
+
+    rows = run(True)
+    loosened = False
+    if not rows and structured and found["words"]:
+        rows, loosened = run(False), True  # nothing matches every word: show the closest by the clear filters
+    interpretation = {k: v for k, v in found.items() if v}
+    body = {"found": bool(rows), "loosened": loosened and bool(rows), "interpretation": interpretation,
+            "results": [review_json(r) for r in rows]}
+    if not rows:  # an honest "I don't know", with places to start from
+        cities = h.con.execute("SELECT city, COUNT(*) AS n FROM reviews WHERE city <> 'other' GROUP BY city ORDER BY n DESC, city LIMIT 4").fetchall()
+        body["suggestions"] = {"cities": [r["city"] for r in cities], "categories": [c for c in CATEGORIES if c != "other"]}
+    return body
 
 
 @route("GET", "/api/restaurants")
@@ -1346,10 +1787,24 @@ MORE_REVIEWS = [
 ]
 MORE_LIKES = [5, 4, 4, 3, 3, 2, 2, 1]  # per review, a few each: nobody here becomes famous
 
+# Sample "Experts" (a curated label, set by the site owner; see --set-expert). Fictional demo people.
+DEMO_EXPERTS = {"claude": "Food blogger", "demo_ton": "Street food chef", "demo_nok": "Food writer"}
+
+# Sample collections: (owner, name, description, which reviews to put in it). The conditions are fixed
+# SQL written here, never user input.
+SAMPLE_COLLECTIONS = [
+    ("claude", "Noodle crawl", "Bowls worth a detour, from boat noodles to khao soi.", "category = 'noodles'"),
+    ("claude", "Cash-only classics", "Bring notes: these stalls take cash and nothing else.", "cash_only = 1"),
+    ("claude", "Late-night bites", "Still serving when everything else has closed.",
+     "(close_time < open_time OR close_time >= '22:00')"),
+    ("test_blogger", "Basil lovers", "Every pad kra pao I would cross the city for.", "category = 'kra_pao'"),
+]
+
 
 def _add_sample_review(con, user_id: int, s: dict, created: int) -> int:
     row = {k: v for k, v in s.items() if k not in ("payments", "open_days")}
     row.setdefault("category", guess_category(s["menu_item"]))
+    row.setdefault("city", guess_city(f"{s.get('area', '')} {s.get('restaurant_name', '')}"))
     row.update(payment_columns(s["payments"]))
     row["open_days"] = ",".join(s["open_days"])
     row.update(user_id=user_id, photo=None, is_sample=1, created_at=created, updated_at=created)
@@ -1398,8 +1853,9 @@ def seed(con) -> bool:
     try:
         if not exists("claude"):
             uid = con.execute(
-                "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, created_at) VALUES(?,?,NULL,?,1,?) RETURNING id",
-                ("claude", "Claude", CLAUDE_BIO, now),
+                "INSERT INTO users(username, display_name, pw_hash, bio, is_featured, is_expert, expert_title, created_at) "
+                "VALUES(?,?,NULL,?,1,1,?,?) RETURNING id",
+                ("claude", "Claude", CLAUDE_BIO, DEMO_EXPERTS["claude"], now),
             ).fetchone()[0]
             for i, s in enumerate(SAMPLE_REVIEWS):
                 _add_sample_review(con, uid, s, now - i * 7200)
@@ -1438,6 +1894,25 @@ def seed(con) -> bool:
             )
             con.commit()
             added = True
+        if version < 4:  # sample Experts and collections (cities are filled in by the review upgrade)
+            for username, title in DEMO_EXPERTS.items():
+                con.execute("UPDATE users SET is_expert = 1, expert_title = ? WHERE lower(username) = ? AND is_expert = 0",
+                            (title, username))
+            for owner, name, description, condition in SAMPLE_COLLECTIONS:
+                row = con.execute("SELECT id FROM users WHERE lower(username) = ?", (owner,)).fetchone()
+                if not row or con.execute("SELECT 1 FROM collections WHERE user_id = ? AND name = ?", (row[0], name)).fetchone():
+                    continue
+                cid = con.execute(
+                    "INSERT INTO collections(user_id, name, description, is_public, created_at, updated_at) VALUES(?,?,?,1,?,?) RETURNING id",
+                    (row[0], name, description, now, now),
+                ).fetchone()[0]
+                con.execute(
+                    "INSERT INTO collection_items(collection_id, review_id, added_at) "
+                    f"SELECT CAST(? AS BIGINT), id, CAST(? AS BIGINT) FROM reviews WHERE {condition} ORDER BY id LIMIT 8",
+                    (cid, now * 1000),
+                )
+            con.commit()
+            added = True
     except db.integrity_errors:
         con.rollback()  # another server process is seeding at this very moment, which is fine
     db.set_meta(con, "seed_version", SEED_VERSION)
@@ -1471,6 +1946,23 @@ def reset_password(username: str) -> int:
         con.close()
 
 
+def set_expert(username: str, title: str, on: bool = True) -> int:
+    """Give a user the Expert badge (or take it away). There is no sign-up for it: the site owner decides."""
+    con = connect()
+    try:
+        row = con.execute("SELECT id, username FROM users WHERE lower(username) = lower(?)", (username,)).fetchone()
+        if not row:
+            print(f"No such user: {username}", file=sys.stderr)
+            return 1
+        title = clean_line(title)[:60] if on else ""
+        con.execute("UPDATE users SET is_expert = ?, expert_title = ? WHERE id = ?", (1 if on else 0, title, row["id"]))
+        con.commit()
+        print(f"{row['username']} is now an Expert" + (f" ({title})." if title else ".") if on else f"{row['username']} is no longer an Expert.")
+        return 0
+    finally:
+        con.close()
+
+
 def parse_args(argv=None, environ=None):
     """Command-line options. Each one can also come from an environment variable (what hosting
     platforms use); an explicit flag always wins."""
@@ -1495,6 +1987,9 @@ def parse_args(argv=None, environ=None):
     ap.add_argument("--run-as-uid", type=int, default=env.get("RUBRUB_RUN_AS_UID") or None,
                     help="when started as root, fix data-folder ownership then switch to this user id [RUBRUB_RUN_AS_UID]")
     ap.add_argument("--reset-password", metavar="USERNAME", help="set a new password for a user, then exit")
+    ap.add_argument("--set-expert", metavar="USERNAME", help="give a user the Expert badge, then exit (see --expert-title)")
+    ap.add_argument("--expert-title", default="", help="what the Expert is, e.g. 'Food writer' (with --set-expert)")
+    ap.add_argument("--remove-expert", metavar="USERNAME", help="take the Expert badge away, then exit")
     args = ap.parse_args(argv)
     if not 1 <= args.port <= 65535:
         ap.error("--port must be between 1 and 65535")
@@ -1517,6 +2012,10 @@ def main(argv=None) -> int:
     init_db()
     if args.reset_password:
         return reset_password(args.reset_password)
+    if args.set_expert:
+        return set_expert(args.set_expert, args.expert_title, True)
+    if args.remove_expert:
+        return set_expert(args.remove_expert, "", False)
 
     con = connect()
     try:
